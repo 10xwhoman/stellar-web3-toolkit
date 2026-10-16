@@ -2,6 +2,7 @@
 //!
 //! Advanced pathfinding algorithms for payment channel routing.
 
+use crate::fee_cap::FeeCap;
 use crate::{NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -16,6 +17,8 @@ pub struct Pathfinder {
     max_fee_percent: f64,
     /// Whether to use obfuscation (mix nodes)
     obfuscate: bool,
+    /// Ceiling on per-channel and per-route fees
+    fee_cap: FeeCap,
 }
 
 impl Pathfinder {
@@ -25,6 +28,7 @@ impl Pathfinder {
             max_hops: MAX_ROUTE_HOPS,
             max_fee_percent: 10.0,
             obfuscate: false,
+            fee_cap: FeeCap::protocol(),
         }
     }
 
@@ -44,6 +48,17 @@ impl Pathfinder {
     pub fn with_obfuscation(mut self, enabled: bool) -> Self {
         self.obfuscate = enabled;
         self
+    }
+
+    /// Apply a specific fee cap instead of the protocol default
+    pub fn with_fee_cap(mut self, cap: FeeCap) -> Self {
+        self.fee_cap = cap;
+        self
+    }
+
+    /// The fee cap this pathfinder enforces
+    pub fn fee_cap(&self) -> &FeeCap {
+        &self.fee_cap
     }
 
     /// Find a route using Dijkstra's algorithm
@@ -79,10 +94,19 @@ impl Pathfinder {
             if let Some(neighbors) = graph.adjacency.get(&node) {
                 for (neighbor, channel_id) in neighbors {
                     if let Some(channel) = graph.channels.get(channel_id) {
-                        let (capacity, _) = if &channel.node_a == neighbor {
-                            (channel.capacity_a_to_b, "a_to_b")
+                        if self.fee_cap.check_channel(channel).is_err() {
+                            continue;
+                        }
+
+                        // `neighbor` is the destination of this hop, so the
+                        // capacity that matters is the one leaving the current
+                        // node -- the opposite direction's capacity says
+                        // nothing about whether this hop can forward the
+                        // payment.
+                        let capacity = if &channel.node_a == neighbor {
+                            channel.capacity_b_to_a
                         } else {
-                            (channel.capacity_b_to_a, "b_to_a")
+                            channel.capacity_a_to_b
                         };
 
                         if capacity < current_amount {
@@ -163,12 +187,16 @@ impl Pathfinder {
                         None => continue,
                     };
 
+                    if self.fee_cap.check_channel(channel).is_err() {
+                        continue;
+                    }
+
                     let current_amount =
                         self.get_amount_for_node(&current, &came_from, request.amount);
-                    let (capacity, _) = if &channel.node_a == neighbor {
-                        (channel.capacity_a_to_b, "a_to_b")
+                    let capacity = if &channel.node_a == neighbor {
+                        channel.capacity_b_to_a
                     } else {
-                        (channel.capacity_b_to_a, "b_to_a")
+                        channel.capacity_a_to_b
                     };
 
                     if capacity < current_amount {
@@ -232,10 +260,14 @@ impl Pathfinder {
                     }
 
                     if let Some(channel) = graph.channels.get(channel_id) {
-                        let (capacity, _) = if &channel.node_a == neighbor {
-                            (channel.capacity_a_to_b, "a_to_b")
+                        if self.fee_cap.check_channel(channel).is_err() {
+                            continue;
+                        }
+
+                        let capacity = if &channel.node_a == neighbor {
+                            channel.capacity_b_to_a
                         } else {
-                            (channel.capacity_b_to_a, "b_to_a")
+                            channel.capacity_a_to_b
                         };
 
                         if capacity >= current_amount {
@@ -310,10 +342,14 @@ impl Pathfinder {
                         return false;
                     }
                     if let Some(channel) = graph.channels.get(*channel_id) {
+                        if self.fee_cap.check_channel(channel).is_err() {
+                            return false;
+                        }
+                        // `node_id` is the neighbour being moved to.
                         let capacity = if &channel.node_a == *node_id {
-                            channel.capacity_a_to_b
-                        } else {
                             channel.capacity_b_to_a
+                        } else {
+                            channel.capacity_a_to_b
                         };
                         capacity >= amount
                     } else {
@@ -360,6 +396,15 @@ impl Pathfinder {
         channel.base_fee + proportional_fee + time_lock_fee
     }
 
+    /// Reject a path whose hops or total break the fee cap.
+    ///
+    /// Every search above filters out offensive *channels*, but that alone
+    /// does not bound a route: twenty hops each charging just under the
+    /// per-hop cap still overpay for the payment.
+    fn enforce_fee_cap(&self, amount: i128, path: &[RouteHop]) -> Result<(), RoutingError> {
+        self.fee_cap.check_hops(amount, path)
+    }
+
     fn calculate_amount_at_node(&self, path: &[RouteHop], initial_amount: i128) -> i128 {
         // Amount grows as we pay fees along the path
         let mut amount = initial_amount;
@@ -369,18 +414,30 @@ impl Pathfinder {
         amount
     }
 
+    /// Amount arriving at `node`: the payment plus the fees of every hop that
+    /// precedes it. Walking the `came_from` chain backwards is what makes the
+    /// fee of a hop depend on the amount that actually reaches it.
     fn get_amount_for_node(
         &self,
-        _node: &str,
+        node: &str,
         came_from: &FxHashMap<String, (String, RouteHop)>,
         initial_amount: i128,
     ) -> i128 {
         let mut amount = initial_amount;
-        let mut current = _node.to_string();
+        let mut current = node.to_string();
+        let mut steps = 0usize;
 
-        while let Some((_, hop)) = came_from.get(&current) {
+        while let Some((prev, hop)) = came_from.get(&current) {
             amount += hop.fee;
-            current = current.clone();
+
+            // A cycle in `came_from` would otherwise spin forever; stop after
+            // the longest path the router could ever build.
+            steps += 1;
+            if *prev == current || steps > MAX_ROUTE_HOPS {
+                break;
+            }
+
+            current = prev.clone();
         }
 
         amount
@@ -403,6 +460,8 @@ impl Pathfinder {
                 budget: max_fee,
             });
         }
+
+        self.enforce_fee_cap(amount, &path)?;
 
         Ok(Route {
             hops: path,
@@ -451,6 +510,8 @@ impl Pathfinder {
             });
         }
 
+        self.enforce_fee_cap(amount, &path)?;
+
         Ok(Route {
             hops: path,
             total_fees,
@@ -472,5 +533,120 @@ impl Pathfinder {
 impl Default for Pathfinder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fee_cap::MAX_CHANNEL_FEE_RATE_PPM;
+    use crate::{Channel, Node, NodeFeatures};
+
+    fn graph_with(fee_rates: &[(&str, &str, &str, u32)]) -> NetworkGraph {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            graph.add_node(Node {
+                id: id.to_string(),
+                public_key: vec![1],
+                alias: None,
+                online: true,
+                last_seen: 0,
+                features: NodeFeatures::default(),
+            });
+        }
+
+        for (id, a, b, fee_rate) in fee_rates {
+            graph.add_channel(Channel {
+                id: id.to_string(),
+                node_a: a.to_string(),
+                node_b: b.to_string(),
+                // Headroom for the fees each hop adds on top of the payment.
+                capacity_a_to_b: 5_000_000,
+                capacity_b_to_a: 5_000_000,
+                base_fee: 1,
+                fee_rate: *fee_rate,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: 5_000_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
+        graph
+    }
+
+    fn request() -> RouteRequest {
+        RouteRequest {
+            source: "alice".to_string(),
+            destination: "carol".to_string(),
+            amount: 1_000_000,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    #[test]
+    fn default_pathfinder_enforces_protocol_cap() {
+        let pathfinder = Pathfinder::new();
+        assert_eq!(pathfinder.fee_cap(), &FeeCap::protocol());
+    }
+
+    #[test]
+    fn all_search_algorithms_skip_channels_above_the_fee_rate_cap() {
+        let graph = graph_with(&[
+            ("ch1", "alice", "bob", 1_000),
+            ("ch2", "bob", "carol", MAX_CHANNEL_FEE_RATE_PPM + 1),
+        ]);
+
+        let pathfinder = Pathfinder::new();
+        assert!(pathfinder.find_route_dijkstra(&graph, &request()).is_err());
+        assert!(pathfinder.find_route_astar(&graph, &request()).is_err());
+        assert!(pathfinder.find_route_bfs(&graph, &request()).is_err());
+        assert!(pathfinder.find_random_route(&graph, &request()).is_err());
+    }
+
+    #[test]
+    fn changing_the_cap_changes_which_channels_are_usable() {
+        let graph = graph_with(&[
+            ("ch1", "alice", "bob", 1_000),
+            ("ch2", "bob", "carol", MAX_CHANNEL_FEE_RATE_PPM + 1),
+        ]);
+
+        // Widen the per-channel rate cap and the greedy hop becomes usable.
+        let permissive = FeeCap {
+            max_channel_fee_rate_ppm: MAX_CHANNEL_FEE_RATE_PPM * 2,
+            ..FeeCap::protocol()
+        };
+        let pathfinder = Pathfinder::new().with_fee_cap(permissive);
+        assert!(pathfinder.find_route_dijkstra(&graph, &request()).is_ok());
+    }
+
+    #[test]
+    fn multi_hop_route_total_is_capped() {
+        let graph = graph_with(&[
+            ("ch1", "alice", "bob", MAX_CHANNEL_FEE_RATE_PPM),
+            ("ch2", "bob", "carol", MAX_CHANNEL_FEE_RATE_PPM),
+        ]);
+
+        // Both hops are legal on their own, but a route budget of zero rejects
+        // the route even though no single hop broke its own cap.
+        let strict = Pathfinder::new().with_fee_cap(FeeCap {
+            max_route_fee_ppm: 0,
+            max_route_fee_abs: 0,
+            ..FeeCap::protocol()
+        });
+        assert!(matches!(
+            strict.find_route_dijkstra(&graph, &request()).unwrap_err(),
+            RoutingError::RouteFeeCapExceeded { .. }
+        ));
+
+        // The protocol cap accepts the very same route.
+        assert!(Pathfinder::new()
+            .find_route_dijkstra(&graph, &request())
+            .is_ok());
     }
 }
