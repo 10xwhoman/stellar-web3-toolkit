@@ -4,9 +4,12 @@
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
 
+pub mod fee_cap;
 pub mod graph;
 pub mod pathfinder;
 pub mod policy;
+
+pub use fee_cap::FeeCap;
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -59,6 +62,37 @@ pub enum RoutingError {
 
     #[error("Invalid node address")]
     InvalidNodeAddress,
+
+    #[error(
+        "Channel {channel_id} advertises a fee rate of {fee_rate} ppm, above the protocol cap of {cap} ppm"
+    )]
+    ChannelFeeRateCapExceeded {
+        channel_id: String,
+        fee_rate: u32,
+        cap: u32,
+    },
+
+    #[error(
+        "Channel {channel_id} advertises a base fee of {base_fee}, above the protocol cap of {cap}"
+    )]
+    ChannelBaseFeeCapExceeded {
+        channel_id: String,
+        base_fee: i128,
+        cap: i128,
+    },
+
+    #[error("Hop fee {fee} for channel {channel_id} exceeds the cap of {cap}")]
+    HopFeeCapExceeded {
+        channel_id: String,
+        fee: i128,
+        cap: i128,
+    },
+
+    #[error("Route fee {fee} for amount {amount} exceeds the cap of {cap}")]
+    RouteFeeCapExceeded { fee: i128, cap: i128, amount: i128 },
+
+    #[error("Route declares {declared} in fees but its hops sum to {actual}")]
+    InconsistentRouteFees { declared: i128, actual: i128 },
 }
 
 /// Represents a node in the payment channel network
@@ -425,10 +459,23 @@ pub fn calculate_channel_fee(
     base_fee + proportional_fee + time_lock_fee
 }
 
-/// Find the best route using Dijkstra's algorithm with fees
+/// Find the best route using Dijkstra's algorithm with fees.
+///
+/// Channels and routes are held to the network-wide [`FeeCap::protocol`].
+/// Use [`find_best_route_with_cap`] to apply a stricter budget.
 pub fn find_best_route(
     graph: &NetworkGraph,
     request: &RouteRequest,
+) -> Result<Route, RoutingError> {
+    find_best_route_with_cap(graph, request, &FeeCap::protocol())
+}
+
+/// Find the best route using Dijkstra's algorithm with fees, rejecting any
+/// channel or route that breaks `cap`.
+pub fn find_best_route_with_cap(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    cap: &FeeCap,
 ) -> Result<Route, RoutingError> {
     // Validate inputs
     if request.amount <= 0 {
@@ -455,9 +502,15 @@ pub fn find_best_route(
     // Dijkstra's algorithm with weighted edges (fees)
     let mut dist: FxHashMap<String, i128> = FxHashMap::default();
     let mut prev: FxHashMap<String, (String, String, i128, i128)> = FxHashMap::default(); // node -> (prev_node, channel_id, amount, fee)
+                                                                                          // The amount that actually arrives at each node. A hop's fee is charged on
+                                                                                          // the amount forwarded through it, which is the payment plus every fee
+                                                                                          // already paid upstream, so this has to be tracked per node rather than
+                                                                                          // derived from the accumulated fee.
+    let mut amount_at: FxHashMap<String, i128> = FxHashMap::default();
     let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
 
     dist.insert(request.source.clone(), 0);
+    amount_at.insert(request.source.clone(), request.amount);
     pq.push(request.source.clone(), Reverse(0));
 
     while let Some((node_id, Reverse(dist_cost))) = pq.pop() {
@@ -471,23 +524,30 @@ pub fn find_best_route(
             continue;
         }
 
-        // Get current amount being routed (from fees accumulated)
-        let current_amount = if node_id == request.source {
-            request.amount
-        } else {
-            // Calculate the amount at this node based on fees paid so far
-            dist_cost
-        };
+        // Amount arriving at this node, which is what the next hop charges on.
+        let current_amount = *amount_at.get(&node_id).unwrap_or(&request.amount);
 
         // Check all neighbors
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = graph.channels.get(channel_id) {
-                    // Determine direction and available capacity
+                    // A hop that advertises an absurd fee schedule is never
+                    // admitted, no matter how cheap the rest of the route is.
+                    if cap.check_channel(channel).is_err() {
+                        continue;
+                    }
+
+                    // Determine direction and available capacity.
+                    //
+                    // `neighbor_id` is where we are heading, so the capacity we
+                    // need is the one leaving `node_id`: when the neighbour is
+                    // `node_a`, we are `node_b` and travel along `b_to_a`.
+                    // Reading the opposite direction lets a payment be routed
+                    // through a hop that has no room for it.
                     let (available_capacity, _direction) = if &channel.node_a == neighbor_id {
-                        (channel.capacity_a_to_b, Direction::AToB)
-                    } else {
                         (channel.capacity_b_to_a, Direction::BToA)
+                    } else {
+                        (channel.capacity_a_to_b, Direction::AToB)
                     };
 
                     // Skip if channel doesn't have enough capacity
@@ -509,6 +569,7 @@ pub fn find_best_route(
                     // Check if this is a better path
                     if next_dist < *dist.get(neighbor_id).unwrap_or(&i128::MAX) {
                         dist.insert(neighbor_id.clone(), next_dist);
+                        amount_at.insert(neighbor_id.clone(), current_amount + fee);
                         prev.insert(
                             neighbor_id.clone(),
                             (node_id.clone(), channel_id.clone(), current_amount, fee),
@@ -578,7 +639,7 @@ pub fn find_best_route(
         }
     }
 
-    Ok(Route {
+    let route = Route {
         hops,
         total_fees,
         total_amount: request.amount,
@@ -592,7 +653,12 @@ pub fn find_best_route(
             estimated_time_ms: 100,
             is_direct: num_hops == 1,
         },
-    })
+    };
+
+    // Individually acceptable hops can still add up past the payment budget.
+    cap.check_route(request.amount, &route)?;
+
+    Ok(route)
 }
 
 /// Find multiple routes using k-shortest paths
@@ -734,5 +800,233 @@ mod tests {
         let route = find_best_route(&graph, &request).unwrap();
         assert_eq!(route.hops.len(), 2);
         assert_eq!(route.total_amount, 100);
+    }
+
+    fn add_node(graph: &mut NetworkGraph, id: &str) {
+        graph.add_node(Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 1000,
+            features: NodeFeatures::default(),
+        });
+    }
+
+    fn add_edge(graph: &mut NetworkGraph, id: &str, a: &str, b: &str, fee_rate: u32) {
+        graph.add_channel(Channel {
+            id: id.to_string(),
+            node_a: a.to_string(),
+            node_b: b.to_string(),
+            // Capacity has to cover the payment plus the fees of the hops
+            // that forward it, since each hop adds its fee to the amount.
+            capacity_a_to_b: 5_000_000,
+            capacity_b_to_a: 5_000_000,
+            base_fee: 1,
+            fee_rate,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 3600,
+        });
+    }
+
+    fn request(source: &str, destination: &str, amount: i128) -> RouteRequest {
+        RouteRequest {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            amount,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    #[test]
+    fn route_through_channel_above_fee_rate_cap_is_not_found() {
+        // alice - bob is honest, bob - carol is greedy. The only route to
+        // carol runs through the greedy hop, so routing must fail rather than
+        // forward the payment at an uncapped fee.
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(
+            &mut graph,
+            "ch2",
+            "bob",
+            "carol",
+            fee_cap::MAX_CHANNEL_FEE_RATE_PPM + 1,
+        );
+
+        let err = find_best_route(&graph, &request("alice", "carol", 1_000)).unwrap_err();
+        assert!(matches!(err, RoutingError::NoPathFound { .. }));
+    }
+
+    #[test]
+    fn route_through_channel_above_base_fee_cap_is_not_found() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 0);
+        if let Some(channel) = graph.channels.get_mut("ch1") {
+            channel.base_fee = fee_cap::MAX_CHANNEL_BASE_FEE + 1;
+        }
+
+        let err = find_best_route(&graph, &request("alice", "bob", 1_000)).unwrap_err();
+        assert!(matches!(err, RoutingError::NoPathFound { .. }));
+    }
+
+    #[test]
+    fn route_total_fee_is_capped() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(
+            &mut graph,
+            "ch1",
+            "alice",
+            "bob",
+            fee_cap::MAX_CHANNEL_FEE_RATE_PPM,
+        );
+        add_edge(
+            &mut graph,
+            "ch2",
+            "bob",
+            "carol",
+            fee_cap::MAX_CHANNEL_FEE_RATE_PPM,
+        );
+
+        // With a 0 ppm, no-allowance route cap the two hops' flat base fees
+        // alone already exceed the budget.
+        let cap = FeeCap {
+            max_route_fee_ppm: 0,
+            max_route_fee_abs: 0,
+            ..FeeCap::protocol()
+        };
+        let err = find_best_route_with_cap(&graph, &request("alice", "carol", 1_000_000), &cap)
+            .unwrap_err();
+
+        match err {
+            RoutingError::HopFeeCapExceeded { .. } | RoutingError::RouteFeeCapExceeded { .. } => {}
+            other => panic!("expected a fee cap violation, got {other}"),
+        }
+
+        // The protocol cap accepts the same route.
+        assert!(find_best_route(&graph, &request("alice", "carol", 1_000_000)).is_ok());
+
+        // The boundary is inclusive: a cap exactly equal to the route fee is
+        // accepted, one stroop less is not.
+        let exact = FeeCap::protocol();
+        let route = find_best_route(&graph, &request("alice", "carol", 1_000_000)).unwrap();
+        // 1_000_000 * 0.5% + 1 base fee = 5_001 on the first hop, then the
+        // second hop charges on the 1_005_001 that arrives there.
+        assert_eq!(route.total_fees, 5_001 + 5_026);
+        assert!(exact
+            .check_route_fee(route.total_amount, route.total_fees)
+            .is_ok());
+
+        let one_less = FeeCap {
+            max_route_fee_abs: route.total_fees - 1,
+            max_route_fee_ppm: 0,
+            ..FeeCap::protocol()
+        };
+        assert!(
+            find_best_route_with_cap(&graph, &request("alice", "carol", 1_000_000), &one_less)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn route_and_hop_fees_agree_under_the_cap() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        let route = find_best_route(&graph, &request("alice", "carol", 1_000_000)).unwrap();
+        let hop_sum: i128 = route.hops.iter().map(|h| h.fee).sum();
+        assert_eq!(route.total_fees, hop_sum);
+        assert!(FeeCap::protocol().check_route(1_000_000, &route).is_ok());
+    }
+
+    #[test]
+    fn capacity_is_directional() {
+        // A channel is only funded one way here: 1_000 stroops can leave alice
+        // for bob, but nothing can leave bob for alice. Routing must use the
+        // direction of travel, not whichever capacity field it finds first.
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        graph.add_channel(Channel {
+            id: "ch1".to_string(),
+            node_a: "alice".to_string(),
+            node_b: "bob".to_string(),
+            capacity_a_to_b: 1_000,
+            capacity_b_to_a: 0,
+            base_fee: 1,
+            fee_rate: 1_000,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 1_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 3600,
+        });
+
+        assert!(find_best_route(&graph, &request("alice", "bob", 500)).is_ok());
+        assert!(matches!(
+            find_best_route(&graph, &request("bob", "alice", 500)).unwrap_err(),
+            RoutingError::NoPathFound { .. }
+        ));
+
+        // And the same through the pathfinder's search algorithms.
+        let pathfinder = pathfinder::Pathfinder::new();
+        assert!(pathfinder
+            .find_route_dijkstra(&graph, &request("alice", "bob", 500))
+            .is_ok());
+        assert!(pathfinder
+            .find_route_bfs(&graph, &request("alice", "bob", 500))
+            .is_ok());
+        assert!(pathfinder
+            .find_route_astar(&graph, &request("alice", "bob", 500))
+            .is_ok());
+        assert!(pathfinder
+            .find_route_dijkstra(&graph, &request("bob", "alice", 500))
+            .is_err());
+        assert!(pathfinder
+            .find_route_bfs(&graph, &request("bob", "alice", 500))
+            .is_err());
+        assert!(pathfinder
+            .find_route_astar(&graph, &request("bob", "alice", 500))
+            .is_err());
+    }
+
+    #[test]
+    fn k_routes_also_respect_the_fee_cap() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(
+            &mut graph,
+            "ch2",
+            "bob",
+            "carol",
+            fee_cap::MAX_CHANNEL_FEE_RATE_PPM * 4,
+        );
+
+        let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
+        assert!(routes.is_empty());
     }
 }
