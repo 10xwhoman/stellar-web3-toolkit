@@ -42,6 +42,18 @@ pub struct WatchtowerConfig {
     pub db_path: Option<String>,
     /// Alert webhook URL
     pub alert_webhook_url: Option<String>,
+    /// Retention rules applied when the store is compacted
+    #[serde(default)]
+    pub compaction: storage::CompactionPolicy,
+    /// How often to compact storage, in seconds. Zero disables the automatic
+    /// pass, leaving [`Watchtower::compact_storage`] as the only entry point.
+    #[serde(default = "default_compaction_interval_secs")]
+    pub compaction_interval_secs: u64,
+}
+
+/// Default automatic compaction interval: hourly.
+fn default_compaction_interval_secs() -> u64 {
+    3_600
 }
 
 impl Default for WatchtowerConfig {
@@ -56,6 +68,8 @@ impl Default for WatchtowerConfig {
             justice_fee_budget: 100_000, // 0.1 XLM
             db_path: None,
             alert_webhook_url: None,
+            compaction: storage::CompactionPolicy::default(),
+            compaction_interval_secs: default_compaction_interval_secs(),
         }
     }
 }
@@ -216,6 +230,10 @@ pub struct WatchtowerState {
     pub is_running: RwLock<bool>,
     /// Statistics
     pub stats: RwLock<WatchtowerStats>,
+    /// Unix timestamp of the last storage compaction
+    pub last_compaction_ts: RwLock<u64>,
+    /// Storage backend, shared with the owning [`Watchtower`]
+    storage: Arc<dyn storage::StorageBackend>,
 }
 
 /// Watchtower statistics
@@ -233,6 +251,10 @@ pub struct WatchtowerStats {
     pub last_scan_ts: u64,
     /// Uptime in seconds
     pub uptime_secs: u64,
+    /// Total storage compaction passes run
+    pub compactions_run: u64,
+    /// Total records removed by compaction
+    pub records_compacted: u64,
 }
 
 /// Watchtower service
@@ -245,9 +267,7 @@ pub struct Watchtower {
     monitor: monitor::ChannelMonitor,
     /// Justice service
     justice: justice::JusticeService,
-    /// Storage backend
-    // Retained for the RPC/storage wiring still to come.
-    #[allow(dead_code)]
+    /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
 }
 
@@ -276,6 +296,8 @@ impl Watchtower {
             recent_alerts: RwLock::new(Vec::new()),
             is_running: RwLock::new(false),
             stats: RwLock::new(WatchtowerStats::default()),
+            last_compaction_ts: RwLock::new(current_timestamp()),
+            storage: Arc::clone(&storage),
         });
 
         Ok(Watchtower {
@@ -332,7 +354,8 @@ impl Watchtower {
                                 }
                             }
 
-                            // Update stored state
+                            // Update stored state, mirroring it to storage so it
+                            // survives a restart and can be compacted.
                             state.update_channel_state(&channel_id, update);
                         }
                         Ok(None) => {
@@ -351,6 +374,14 @@ impl Watchtower {
                     let mut stats = state.stats.write();
                     stats.last_scan_ts = current_timestamp();
                     stats.channels_monitored = state.subscribed_channels.read().len() as u64;
+                }
+
+                // Compact on a schedule: the store grows per scan, so leaving
+                // retention to an operator's manual call means it never runs.
+                if let Some(report) = state.compact_if_due(&config) {
+                    let mut stats = state.stats.write();
+                    stats.compactions_run += 1;
+                    stats.records_compacted += report.total_removed() as u64;
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs))
@@ -386,7 +417,13 @@ impl Watchtower {
         self.state
             .channel_states
             .write()
-            .insert(channel_id, monitor_state);
+            .insert(channel_id.clone(), monitor_state.clone());
+
+        // A subscription that only lives in memory is lost on restart, and the
+        // channel would then be watched by nobody.
+        self.storage.store_subscription(&channel_id)?;
+        self.storage
+            .store_channel_state(&channel_id, &monitor_state)?;
 
         info!("Subscribed to channel");
         Ok(())
@@ -396,7 +433,32 @@ impl Watchtower {
     pub fn unsubscribe(&self, channel_id: &str) {
         self.state.subscribed_channels.write().remove(channel_id);
         self.state.channel_states.write().remove(channel_id);
+        let _ = self.storage.remove_subscription(channel_id);
         info!("Unsubscribed from channel");
+    }
+
+    /// Channels the watchtower is subscribed to and would reload on restart.
+    pub fn persisted_subscriptions(&self) -> Result<Vec<String>, storage::StorageError> {
+        self.storage.get_subscriptions()
+    }
+
+    /// Run a compaction pass with the configured retention rules.
+    pub fn compact_storage(&self) -> Result<storage::CompactionReport, WatchtowerError> {
+        let report = self.storage.compact(&self.config.compaction)?;
+
+        let mut stats = self.state.stats.write();
+        stats.compactions_run += 1;
+        stats.records_compacted += report.total_removed() as u64;
+        *self.state.last_compaction_ts.write() = current_timestamp();
+
+        info!(
+            "Storage compaction removed {} records ({} alerts, {} channel updates)",
+            report.total_removed(),
+            report.alerts_removed(),
+            report.channel_updates_removed()
+        );
+
+        Ok(report)
     }
 
     /// Get current watchtower status
@@ -413,6 +475,11 @@ impl Watchtower {
         }
     }
 
+    /// Shared watchtower state, for embedders that need to inspect or seed it.
+    pub fn state(&self) -> Arc<WatchtowerState> {
+        Arc::clone(&self.state)
+    }
+
     /// Get recent alerts
     pub fn get_alerts(&self, limit: usize) -> Vec<Alert> {
         self.state
@@ -423,6 +490,16 @@ impl Watchtower {
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    /// The configuration this watchtower was built with.
+    pub fn config(&self) -> &WatchtowerConfig {
+        &self.config
+    }
+
+    /// The storage backend backing this watchtower.
+    pub fn storage(&self) -> &Arc<dyn storage::StorageBackend> {
+        &self.storage
     }
 }
 
@@ -438,13 +515,56 @@ impl WatchtowerState {
         }
     }
 
-    /// Update channel state
+    /// Apply a channel update to the in-memory state and persist both the
+    /// update and the resulting state.
     pub fn update_channel_state(&self, channel_id: &str, update: monitor::ChannelUpdate) {
-        let mut states = self.channel_states.write();
-        if let Some(state) = states.get_mut(channel_id) {
-            state.last_known_sequence = update.sequence_number;
-            state.last_update_ts = current_timestamp();
+        {
+            let mut states = self.channel_states.write();
+            if let Some(state) = states.get_mut(channel_id) {
+                state.last_known_sequence = update.sequence_number;
+                state.last_update_ts = current_timestamp();
+            }
         }
+
+        // Persisting is deliberately best-effort: a storage failure must not
+        // stop the monitor loop from checking the next channel.
+        if let Some(state) = self.channel_states.read().get(channel_id).cloned() {
+            let _ = self.storage.store_channel_state(channel_id, &state);
+        }
+        let _ = self.storage.store_channel_update(&update);
+    }
+
+    /// Run a compaction pass if `compaction_interval_secs` has elapsed.
+    ///
+    /// Returns the report when a pass ran, `None` when it was not due (or when
+    /// automatic compaction is disabled).
+    pub fn compact_if_due(&self, config: &WatchtowerConfig) -> Option<storage::CompactionReport> {
+        if config.compaction_interval_secs == 0 {
+            return None;
+        }
+
+        let now = current_timestamp();
+        let last = *self.last_compaction_ts.read();
+        if now.saturating_sub(last) < config.compaction_interval_secs {
+            return None;
+        }
+
+        // Stamp before compacting so a failing backend cannot make every scan
+        // retry the same expensive pass.
+        *self.last_compaction_ts.write() = now;
+
+        match self.storage.compact(&config.compaction) {
+            Ok(report) => Some(report),
+            Err(e) => {
+                error!("Storage compaction failed: {:?}", e);
+                None
+            }
+        }
+    }
+
+    /// The storage backend shared by this state and its watchtower.
+    pub fn storage(&self) -> &Arc<dyn storage::StorageBackend> {
+        &self.storage
     }
 
     /// Remove a channel
@@ -529,17 +649,135 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::CompactionPolicy;
 
     #[test]
     fn test_watchtower_config() {
         let config = WatchtowerConfig::default();
         assert_eq!(config.scan_interval_secs, 60);
         assert!(config.auto_justice);
+        assert_eq!(config.compaction_interval_secs, 3_600);
     }
 
     #[test]
     fn test_alert_message() {
         let alert = Alert::breach_attempt("channel123".to_string(), 1, 5);
         assert!(alert.message().contains("BREACH"));
+    }
+
+    #[test]
+    fn subscriptions_survive_a_restart() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+
+        watchtower.subscribe("channel-a".to_string()).unwrap();
+        watchtower.subscribe("channel-b".to_string()).unwrap();
+        assert_eq!(
+            watchtower.persisted_subscriptions().unwrap(),
+            vec!["channel-a".to_string(), "channel-b".to_string()]
+        );
+
+        watchtower.unsubscribe("channel-a");
+        assert_eq!(
+            watchtower.persisted_subscriptions().unwrap(),
+            vec!["channel-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn compact_storage_applies_the_configured_policy() {
+        let config = WatchtowerConfig {
+            compaction: CompactionPolicy {
+                alert_retention_secs: 0,
+                ..CompactionPolicy::default()
+            },
+            ..Default::default()
+        };
+        let watchtower = Watchtower::new(config).unwrap();
+
+        let mut stale = Alert::breach_attempt("channel-a".to_string(), 1, 2);
+        stale.timestamp = current_timestamp() - 60;
+        watchtower.storage().store_alert(&stale).unwrap();
+        watchtower
+            .storage()
+            .store_alert(&Alert::breach_attempt("channel-a".to_string(), 2, 3))
+            .unwrap();
+
+        let report = watchtower.compact_storage().unwrap();
+        assert_eq!(report.alerts_removed(), 1);
+        assert_eq!(watchtower.storage().get_alerts(10).unwrap().len(), 1);
+
+        let stats = watchtower.state().stats.read().clone();
+        assert_eq!(stats.compactions_run, 1);
+        assert_eq!(stats.records_compacted, 1);
+    }
+
+    #[test]
+    fn automatic_compaction_only_runs_when_due() {
+        // A fresh watchtower has just compacted, so no pass is due yet.
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        assert!(watchtower
+            .state()
+            .compact_if_due(watchtower.config())
+            .is_none());
+
+        // Rewinding the last-pass timestamp makes the interval elapse.
+        *watchtower.state().last_compaction_ts.write() = 0;
+        assert!(watchtower
+            .state()
+            .compact_if_due(watchtower.config())
+            .is_some());
+
+        // ...and then stamps it again, so the next scan does not re-run it.
+        assert!(watchtower
+            .state()
+            .compact_if_due(watchtower.config())
+            .is_none());
+    }
+
+    #[test]
+    fn automatic_compaction_can_be_disabled() {
+        let config = WatchtowerConfig {
+            compaction_interval_secs: 0,
+            ..Default::default()
+        };
+        let watchtower = Watchtower::new(config).unwrap();
+        *watchtower.state().last_compaction_ts.write() = 0;
+
+        assert!(watchtower
+            .state()
+            .compact_if_due(watchtower.config())
+            .is_none());
+    }
+
+    #[test]
+    fn channel_updates_are_persisted_for_later_compaction() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        watchtower.subscribe("channel-a".to_string()).unwrap();
+
+        let update = monitor::ChannelUpdate {
+            channel_id: "channel-a".to_string(),
+            sequence_number: 4,
+            balance_a: 10,
+            balance_b: 20,
+            is_closed: false,
+            close_type: None,
+            block_height: 100,
+            timestamp: current_timestamp(),
+        };
+        watchtower.state().update_channel_state("channel-a", update);
+
+        let stored = watchtower
+            .storage()
+            .get_channel_update("channel-a")
+            .unwrap()
+            .expect("update should be persisted");
+        assert_eq!(stored.sequence_number, 4);
+
+        let state = watchtower
+            .storage()
+            .get_channel_state("channel-a")
+            .unwrap()
+            .expect("state should be persisted");
+        assert_eq!(state.last_known_sequence, 4);
     }
 }
