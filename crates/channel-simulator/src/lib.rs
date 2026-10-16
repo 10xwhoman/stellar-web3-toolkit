@@ -3,6 +3,7 @@
 //! A simulator for testing Stellar payment channel networks with 100+ nodes.
 //! Supports network generation, payment simulation, and routing algorithm testing.
 
+pub mod fuzz;
 pub mod network;
 pub mod statistics;
 
@@ -176,13 +177,23 @@ impl Simulator {
 
         info!("Created {} nodes", nodes.len());
 
-        // Create channels based on configuration
+        // Create channels based on configuration. The target is capped at the
+        // number of distinct node pairs and the retry loop is bounded, so a
+        // configuration asking for more channels than the node count allows
+        // finishes with a full graph instead of spinning forever.
         let node_ids: Vec<String> = nodes.keys().cloned().collect();
-        let target_channels =
-            (self.config.num_nodes as f64 * self.config.avg_channels_per_node) as usize;
+        let max_possible_channels =
+            self.config.num_nodes * self.config.num_nodes.saturating_sub(1) / 2;
+        let target_channels = ((self.config.num_nodes as f64 * self.config.avg_channels_per_node)
+            as usize)
+            .min(max_possible_channels);
+        let max_attempts = target_channels * 20 + 100;
         let mut channels_created = 0;
+        let mut attempts = 0;
 
-        while channels_created < target_channels {
+        while channels_created < target_channels && attempts < max_attempts {
+            attempts += 1;
+
             // Pick two random nodes
             let idx_a = rng.gen_range(0..node_ids.len());
             let idx_b = rng.gen_range(0..node_ids.len());
@@ -194,10 +205,13 @@ impl Simulator {
             let node_a = &node_ids[idx_a];
             let node_b = &node_ids[idx_b];
 
-            // Check if channel already exists
+            // Check whether these two nodes are already joined. Asking whether
+            // *any* node touches both of them is a different question, and
+            // makes the loop give up on pairs that are still free.
             let existing = nodes
-                .values()
-                .any(|n| n.channels.contains(node_a) && n.channels.contains(node_b));
+                .get(node_a)
+                .map(|n| n.channels.contains(node_b))
+                .unwrap_or(false);
 
             if existing {
                 continue;

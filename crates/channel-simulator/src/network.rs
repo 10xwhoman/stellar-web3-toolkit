@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Network topology types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TopologyType {
     /// Random graph topology
     Random,
@@ -90,12 +90,22 @@ impl NetworkTopology {
             node_ids.push(node_id);
         }
 
-        // Create random edges
+        // Create random edges. A random pair can only be drawn once, so the
+        // target is capped at the number of distinct pairs and the retry loop
+        // is bounded: asking for more edges than the node count allows would
+        // otherwise spin forever once the space of pairs is exhausted.
+        let max_possible_edges =
+            self.config.num_nodes * self.config.num_nodes.saturating_sub(1) / 2;
         let target_edges =
-            (self.config.num_nodes as f64 * self.config.avg_channels_per_node / 2.0) as usize;
+            ((self.config.num_nodes as f64 * self.config.avg_channels_per_node / 2.0) as usize)
+                .min(max_possible_edges);
+        let max_attempts = target_edges * 20 + 100;
         let mut edges_created = 0;
+        let mut attempts = 0;
 
-        while edges_created < target_edges {
+        while edges_created < target_edges && attempts < max_attempts {
+            attempts += 1;
+
             let a = rng.gen_range(0..node_ids.len());
             let b = rng.gen_range(0..node_ids.len());
 
@@ -106,7 +116,10 @@ impl NetworkTopology {
             let node_a = &node_ids[a];
             let node_b = &node_ids[b];
 
-            // Check if edge exists
+            // Check whether the two endpoints are already joined. Testing
+            // whether *any* node is connected to both of them would reject
+            // pairs that are in fact unconnected, and would not stop a
+            // duplicate edge from being created.
             if nodes
                 .get(node_a)
                 .map(|n| n.channels.contains(node_b))
@@ -185,44 +198,62 @@ impl NetworkTopology {
             }
         }
 
-        // Add remaining nodes with preferential attachment
+        // Add remaining nodes with preferential attachment.
+        //
+        // Candidates are drawn from `node_ids[..i]` rather than from the node
+        // map: `HashMap` iteration order is randomly seeded per process, so
+        // drawing from it made the same seed produce a different topology on
+        // every run, which is fatal for a fuzzer whose failures have to be
+        // replayable.
         let m = 2.min(self.config.avg_channels_per_node as usize / 2);
         for i in m0..self.config.num_nodes {
-            let mut targets = HashSet::new();
+            let mut targets: Vec<String> = Vec::with_capacity(m);
 
             while targets.len() < m {
-                // Select target with probability proportional to degree.
-                //
-                // Only the first `i` nodes are eligible, so the degrees being
-                // weighed have to cover the same set the walk below does --
-                // otherwise the draw can fall past the end of the walk.
-                let total_degree: usize = nodes.values().take(i).map(|n| n.channels.len()).sum();
+                // Only nodes that have not been picked yet may be drawn, and
+                // the draw is weighted by degree. Selecting from all eligible
+                // nodes instead can return the same node forever -- a single
+                // hub can hold every edge, giving it probability 1 -- so the
+                // loop would never collect `m` distinct targets.
+                let eligible: Vec<&String> = node_ids[..i]
+                    .iter()
+                    .filter(|id| !targets.contains(id))
+                    .collect();
 
-                if total_degree == 0 {
-                    // Fallback to random
-                    let j = rng.gen_range(0..i);
-                    targets.insert(node_ids[j].clone());
+                if eligible.is_empty() {
+                    break;
+                }
+
+                let total_degree: usize = eligible.iter().map(|id| nodes[*id].channels.len()).sum();
+
+                let chosen = if total_degree == 0 {
+                    // Nothing is connected yet: pick uniformly.
+                    eligible[rng.gen_range(0..eligible.len())].clone()
                 } else {
                     // Walk the eligible nodes in order and take the one whose
-                    // slice contains the draw. The bound must be tested *before*
-                    // subtracting: `r` is unsigned, so the previous
-                    // `r -= degree; if r < 0` underflowed and its `< 0` test could
-                    // never be true, leaving this branch a guaranteed panic in
-                    // debug builds and a silently biased choice in release.
+                    // slice contains the draw. The bound must be tested
+                    // *before* subtracting: `r` is unsigned, so the previous
+                    // `r -= degree; if r < 0` underflowed and its `< 0` test
+                    // could never be true, leaving this branch a guaranteed
+                    // panic in debug builds and a silently biased choice in
+                    // release.
                     let mut r = rng.gen_range(0..total_degree);
                     let mut picked = None;
-                    for (id, node) in nodes.iter().take(i) {
-                        if r < node.channels.len() {
-                            picked = Some(id.clone());
+                    for id in &eligible {
+                        let degree = nodes[*id].channels.len();
+                        if r < degree {
+                            picked = Some((*id).clone());
                             break;
                         }
-                        r -= node.channels.len();
+                        r -= degree;
                     }
-                    // Defensive: a node with degree 0 in the last position cannot
-                    // absorb the draw, so fall back instead of spinning forever.
-                    let chosen = picked.unwrap_or_else(|| node_ids[rng.gen_range(0..i)].clone());
-                    targets.insert(chosen);
-                }
+
+                    // Defensive: a zero-degree node cannot absorb the draw, so
+                    // fall back rather than spin.
+                    picked.unwrap_or_else(|| eligible[rng.gen_range(0..eligible.len())].clone())
+                };
+
+                targets.push(chosen);
             }
 
             for target in targets {
@@ -273,19 +304,47 @@ impl NetworkTopology {
             }
         }
 
-        // Rewire edges with probability
+        // Rewire edges with probability.
+        //
+        // Each undirected edge appears twice in the per-node channel sets, so
+        // it has to be visited once: iterating every half-edge would remove the
+        // same edge twice and pick two unrelated new neighbours for it.
         let p = 0.1; // Rewiring probability
-        let edges: Vec<(String, String)> = nodes
+        let mut edges: Vec<(String, String)> = nodes
             .values()
             .flat_map(|n| n.channels.iter().map(|c| (n.node.id.clone(), c.clone())))
+            .filter(|(a, b)| a < b)
             .collect();
+        edges.sort();
 
         for (source, target) in edges {
+            // A previous rewire may already have removed this edge.
+            if !nodes
+                .get(&source)
+                .map(|n| n.channels.contains(&target))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             if rng.gen::<f64>() < p {
-                // Remove edge
+                // Remove the edge, taking the channel id from the adjacency
+                // list rather than rebuilding it: `add_edge` names channels
+                // after the endpoint order it was called with, so a
+                // reconstructed id can point at the wrong channel (or at
+                // nothing) and leave the edge in the graph.
+                let channel_id = graph
+                    .adjacency
+                    .get(&source)
+                    .and_then(|neighbours| neighbours.get(&target))
+                    .cloned();
+
                 nodes.get_mut(&source).unwrap().channels.remove(&target);
                 nodes.get_mut(&target).unwrap().channels.remove(&source);
-                graph.remove_channel(&format!("{}_{}", source, target));
+
+                if let Some(channel_id) = channel_id {
+                    graph.remove_channel(&channel_id);
+                }
 
                 // Add random new edge
                 let new_target = node_ids[rng.gen_range(0..self.config.num_nodes)].clone();
@@ -332,18 +391,21 @@ impl NetworkTopology {
             node_ids.push(node_id);
         }
 
-        // Connect to neighbors
+        // Connect to neighbors.
+        //
+        // The grid is row-major with a possibly partial last row, so being in
+        // the last column does not imply the node to the right exists: the
+        // index still has to be inside `num_nodes`. Testing `col + 1 < size`
+        // alone indexes past the end of `node_ids` whenever the last row is
+        // short (or whenever there is only one row).
         for i in 0..self.config.num_nodes {
-            let row = i / size;
-            let col = i % size;
-
             // Right neighbor
-            if col + 1 < size {
+            if i + 1 < self.config.num_nodes && (i % size) + 1 < size {
                 self.add_edge(&node_ids[i], &node_ids[i + 1], &mut graph, &mut nodes, rng);
             }
 
             // Bottom neighbor
-            if row + 1 < size {
+            if i + size < self.config.num_nodes {
                 self.add_edge(
                     &node_ids[i],
                     &node_ids[i + size],
@@ -504,6 +566,18 @@ impl NetworkTopology {
         rng: &mut R,
     ) {
         if node_a == node_b {
+            return;
+        }
+
+        // Idempotent: the lattice, ring and grid generators all reach the same
+        // pair from both ends, and a second channel between a pair leaves the
+        // adjacency map (one entry per neighbour) disagreeing with the channel
+        // set about how the network is wired.
+        if nodes
+            .get(node_a)
+            .map(|node| node.channels.contains(node_b))
+            .unwrap_or(false)
+        {
             return;
         }
 
