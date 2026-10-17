@@ -54,4 +54,10 @@ pub enum AtomicSwapError {
 
     #[error("Configuration error: {0}")]
     ConfigError(String),
+
+    /// Cross-chain replay protection refused the transfer (#238). The source
+    /// variant is preserved so a caller can tell a replay from a chain
+    /// mismatch without parsing the message.
+    #[error(transparent)]
+    Replay(#[from] crate::replay::ReplayError),
 }

@@ -165,6 +165,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Informal Verification](docs/INFORMAL_VERIFICATION.md) - Property harness, invariant catalogue, how to add one (Issue #116)
 - [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
+- [Cross-Chain Replay Protection](docs/CROSS_CHAIN_REPLAY.md) - Chain-bound intent digests, per-domain nonce windows and the replay runbook (Issue #238)
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)
 - [Rust Documentation](https://doc.rust-lang.org/)

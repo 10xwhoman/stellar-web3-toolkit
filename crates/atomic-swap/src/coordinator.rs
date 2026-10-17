@@ -2,6 +2,7 @@ use crate::asset::{Asset, AssetInfo, AssetRegistry};
 use crate::error::{AtomicSwapError, Result};
 use crate::monitor::{MonitoringConfig, SwapMonitor};
 use crate::preimage::PreimageManager;
+use crate::replay::{ReplayError, ReplayGuard, ReplayStats};
 use crate::swap::{AtomicSwap, SwapTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +18,13 @@ pub struct SwapRequest {
     pub initiator_amount: i128,
     pub participant_amount: i128,
     pub timeout_hours: u32,
+    /// Chain the initiating transfer came from, when this swap is one leg of a
+    /// cross-chain flow (#238). `None` for a purely local swap.
+    pub origin_chain: Option<String>,
+    /// Sender-chosen nonce of that transfer. Required together with
+    /// `origin_chain`, and consumed exactly once by the coordinator's replay
+    /// guard.
+    pub nonce: Option<u64>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -57,6 +65,8 @@ pub struct AtomicSwapCoordinator {
     templates: Arc<RwLock<HashMap<String, SwapTemplate>>>,
     asset_registry: Arc<RwLock<AssetRegistry>>,
     preimage_manager: Arc<RwLock<PreimageManager>>,
+    /// Consumes cross-chain `(chain, sender, nonce)` triples once each (#238).
+    replay: Arc<RwLock<ReplayGuard>>,
     monitor: SwapMonitor,
     config: SwapConfig,
 }
@@ -71,6 +81,7 @@ impl AtomicSwapCoordinator {
             templates: Arc::new(RwLock::new(HashMap::new())),
             asset_registry: Arc::new(RwLock::new(AssetRegistry::new())),
             preimage_manager: Arc::new(RwLock::new(PreimageManager::new())),
+            replay: Arc::new(RwLock::new(ReplayGuard::new())),
             monitor,
             config,
         }
@@ -84,6 +95,11 @@ impl AtomicSwapCoordinator {
     ) -> Result<SwapResponse> {
         // Validate request
         self.validate_swap_request(&request)?;
+
+        // Consume the cross-chain nonce before anything is created, so a
+        // replayed transfer is refused while the coordinator still has no side
+        // effects to undo (#238).
+        self.consume_cross_chain_nonce(&initiator, &request).await?;
 
         // Check asset support
         let asset_registry = self.asset_registry.read().await;
@@ -125,6 +141,12 @@ impl AtomicSwapCoordinator {
             timeout_ledger,
             current_ledger,
         );
+
+        // Record where the transfer came from, so a later audit can tie the
+        // swap back to the nonce that authorised it.
+        if let (Some(chain), Some(nonce)) = (&request.origin_chain, request.nonce) {
+            swap = swap.with_origin(chain.clone(), nonce);
+        }
 
         // Add metadata
         for (key, value) in request.metadata {
@@ -275,6 +297,12 @@ impl AtomicSwapCoordinator {
 
         if intermediary_assets.is_empty() {
             // Direct swap if no intermediary needed
+            //
+            // A multi-hop route is assembled out of internal legs: each leg
+            // moves value between hop accounts rather than across chains, so no
+            // leg consumes a cross-chain nonce. The nonce belongs to the
+            // transfer that entered the route, which the operator presents to
+            // `initiate_swap` directly.
             let request = SwapRequest {
                 participant,
                 initiator_asset: initiator_asset.clone(),
@@ -282,6 +310,8 @@ impl AtomicSwapCoordinator {
                 initiator_amount,
                 participant_amount,
                 timeout_hours,
+                origin_chain: None,
+                nonce: None,
                 metadata: HashMap::new(),
             };
 
@@ -320,6 +350,8 @@ impl AtomicSwapCoordinator {
                 initiator_amount: current_amount,
                 participant_amount: next_amount,
                 timeout_hours,
+                origin_chain: None,
+                nonce: None,
                 metadata: {
                     let mut meta = HashMap::new();
                     meta.insert("hop_index".to_string(), i.to_string());
@@ -366,6 +398,22 @@ impl AtomicSwapCoordinator {
             .collect())
     }
 
+    /// Replay-protection counters plus the number of domains being tracked.
+    pub async fn replay_stats(&self) -> ReplayStats {
+        self.replay.read().await.stats()
+    }
+
+    /// Stop tracking `(chain, sender)`. Only safe once that nonce sequence is
+    /// closed on every chain it can reach.
+    pub async fn forget_replay_domain(&self, chain: &str, sender: &str) -> bool {
+        self.replay.write().await.forget(chain, sender)
+    }
+
+    /// True when this `(chain, sender, nonce)` triple has been consumed.
+    pub async fn nonce_is_recorded(&self, chain: &str, sender: &str, nonce: u64) -> bool {
+        self.replay.read().await.is_recorded(chain, sender, nonce)
+    }
+
     /// Register a new asset
     pub async fn register_asset(&self, asset_info: AssetInfo) -> Result<()> {
         let mut asset_registry = self.asset_registry.write().await;
@@ -391,6 +439,32 @@ impl AtomicSwapCoordinator {
     }
 
     // Private helper methods
+
+    /// Consume the request's cross-chain nonce, if it declares one.
+    ///
+    /// A local swap carries neither field; a cross-chain swap carries both. Half
+    /// an origin is a caller bug and is rejected rather than guessed at, because
+    /// guessing wrong means either a replayed transfer or a legitimate one
+    /// refused.
+    async fn consume_cross_chain_nonce(
+        &self,
+        initiator: &str,
+        request: &SwapRequest,
+    ) -> Result<()> {
+        match (&request.origin_chain, request.nonce) {
+            (Some(chain), Some(nonce)) => {
+                let mut replay = self.replay.write().await;
+                replay.check_and_record(chain, initiator, nonce)?;
+                Ok(())
+            }
+            (Some(_), None) => Err(ReplayError::IncompleteIntent { missing: "nonce" }.into()),
+            (None, Some(_)) => Err(ReplayError::IncompleteIntent {
+                missing: "origin chain",
+            }
+            .into()),
+            (None, None) => Ok(()),
+        }
+    }
 
     fn validate_swap_request(&self, request: &SwapRequest) -> Result<()> {
         if request.initiator_amount < self.config.min_amount {
@@ -478,6 +552,8 @@ mod tests {
             initiator_amount: 1000,
             participant_amount: 500,
             timeout_hours: 24,
+            origin_chain: None,
+            nonce: None,
             metadata: HashMap::new(),
         };
 
@@ -514,6 +590,8 @@ mod tests {
             initiator_amount: 1000,
             participant_amount: 500,
             timeout_hours: 24,
+            origin_chain: None,
+            nonce: None,
             metadata: HashMap::new(),
         };
 
@@ -533,5 +611,143 @@ mod tests {
         // Verify swap is completed
         let swap = coordinator.get_swap(swap_id).await.unwrap();
         assert!(swap.is_completed());
+    }
+
+    /// A coordinator with USDC registered, so an XLM/USDC swap clears asset
+    /// validation and the cross-chain tests can focus on the nonce.
+    async fn coordinator_with_usdc() -> AtomicSwapCoordinator {
+        let coordinator = AtomicSwapCoordinator::new(SwapConfig::default());
+        coordinator
+            .register_asset(AssetInfo::custom(
+                "USDC".to_string(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
+                7,
+            ))
+            .await
+            .expect("registering USDC should succeed");
+        coordinator
+    }
+
+    /// A swap request carrying an optional `(origin chain, nonce)`.
+    fn request_with_origin(origin: Option<(&str, u64)>) -> SwapRequest {
+        SwapRequest {
+            participant: "participant".to_string(),
+            initiator_asset: Asset::XLM,
+            participant_asset: Asset::Custom("USDC".to_string()),
+            initiator_amount: 1000,
+            participant_amount: 500,
+            timeout_hours: 24,
+            origin_chain: origin.map(|(chain, _)| chain.to_string()),
+            nonce: origin.map(|(_, nonce)| nonce),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_chain_nonce_is_consumed_exactly_once() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let accepted = coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 7))),
+            )
+            .await
+            .expect("the first presentation of a nonce is accepted");
+
+        let swap = coordinator.get_swap(accepted.swap_id).await.unwrap();
+        assert!(swap.is_cross_chain());
+        assert_eq!(swap.origin_chain.as_deref(), Some("testnet"));
+        assert_eq!(swap.origin_nonce, Some(7));
+
+        let error = coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 7))),
+            )
+            .await
+            .expect_err("a replayed nonce is refused");
+        assert!(matches!(
+            error,
+            AtomicSwapError::Replay(ReplayError::Replayed { .. })
+        ));
+
+        // The replay must not have created a swap of its own.
+        assert_eq!(
+            coordinator
+                .list_swaps_for_participant("initiator".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            coordinator
+                .nonce_is_recorded("testnet", "initiator", 7)
+                .await
+        );
+        assert_eq!(coordinator.replay_stats().await.replayed, 1);
+    }
+
+    #[tokio::test]
+    async fn the_next_nonce_for_the_same_sender_is_still_accepted() {
+        let coordinator = coordinator_with_usdc().await;
+        for nonce in [1, 2, 3] {
+            coordinator
+                .initiate_swap(
+                    "initiator".to_string(),
+                    request_with_origin(Some(("testnet", nonce))),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("nonce {nonce} rejected: {e}"));
+        }
+        // A different sender reuses nonce 1 legitimately: its own sequence.
+        coordinator
+            .initiate_swap(
+                "other-initiator".to_string(),
+                request_with_origin(Some(("testnet", 1))),
+            )
+            .await
+            .expect("another sender has its own nonce sequence");
+        assert_eq!(coordinator.replay_stats().await.accepted, 4);
+    }
+
+    #[tokio::test]
+    async fn a_local_swap_needs_no_nonce() {
+        let coordinator = coordinator_with_usdc().await;
+        coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .expect("a local swap is not affected by replay protection");
+        assert_eq!(coordinator.replay_stats().await.accepted, 0);
+    }
+
+    #[tokio::test]
+    async fn half_an_origin_is_refused() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let mut without_nonce = request_with_origin(Some(("testnet", 1)));
+        without_nonce.nonce = None;
+        let error = coordinator
+            .initiate_swap("initiator".to_string(), without_nonce)
+            .await
+            .expect_err("an origin chain without a nonce cannot be replayed safely");
+        assert!(matches!(
+            error,
+            AtomicSwapError::Replay(ReplayError::IncompleteIntent { missing: "nonce" })
+        ));
+
+        let mut without_chain = request_with_origin(Some(("testnet", 1)));
+        without_chain.origin_chain = None;
+        let error = coordinator
+            .initiate_swap("initiator".to_string(), without_chain)
+            .await
+            .expect_err("a nonce without a chain has no domain to be consumed in");
+        assert!(matches!(
+            error,
+            AtomicSwapError::Replay(ReplayError::IncompleteIntent {
+                missing: "origin chain"
+            })
+        ));
     }
 }
