@@ -83,11 +83,34 @@ let tx = claimer.claim_airdrop("GCLAIMANT...", "airdrop-event-2026", &proof)?;
             cli_run_command: "stellar-toolkit example run --id one-click-airdrop --network testnet".to_string(),
         };
 
+        let mobile_wallet_example = ContractExample {
+            id: "mobile-wallet-dapp".to_string(),
+            title: "Mobile Wallet Contract Dapp".to_string(),
+            category: "Wallet / Mobile".to_string(),
+            description: "Connects a wallet to a toolkit contract on a phone: signs a payment, simulates a read, prepares and submits a write, hands the payment to a wallet app with a SEP-7 deep link when there is no extension, and recovers an account from a BIP-39 phrase.".to_string(),
+            contract_wasm_hash: "d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef123456".to_string(),
+            rust_snippet: r#"
+// examples/mobile-wallet-dapp — the wallet-facing half, in JS:
+//   const wallet = createWallet({ config, server, provider });
+//   await wallet.sendPayment({ from, to, amount: '1.5' });
+//   await wallet.readContract({ from, contractId, method: 'balance_of', args: [holder] });
+//   await wallet.invokeContract({ from, contractId, method: 'deposit', args: [holder, token, amount] });
+//
+// The contract call it is wired to, from a Rust test:
+let client = TokenLockerClient::new(&env, &contract_id);
+client.deposit(&holder, &token, &1_000);
+assert_eq!(client.balance_of(&holder, &token), 1_000);
+            "#.trim().to_string(),
+            cli_run_command: "stellar-toolkit example run --id mobile-wallet-dapp --network testnet".to_string(),
+        };
+
         self.examples.insert(amm_example.id.clone(), amm_example);
         self.examples
             .insert(payment_channel_example.id.clone(), payment_channel_example);
         self.examples
             .insert(airdrop_example.id.clone(), airdrop_example);
+        self.examples
+            .insert(mobile_wallet_example.id.clone(), mobile_wallet_example);
     }
 
     pub fn list_examples(&self) -> Vec<&ContractExample> {
@@ -156,5 +179,29 @@ mod tests {
 
         let md = gallery.export_markdown_gallery();
         assert!(md.contains("# Soroban Contract Example Gallery"));
+    }
+
+    /// The mobile wallet example (#128) is a real entry, and it says where to
+    /// find the dapp rather than only naming a wasm hash.
+    #[test]
+    fn test_mobile_wallet_example_is_registered() {
+        let gallery = ExampleGalleryRegistry::default();
+        let example = gallery
+            .get_example("mobile-wallet-dapp")
+            .expect("the mobile wallet example is registered");
+
+        assert_eq!(example.category, "Wallet / Mobile");
+        assert!(example.description.contains("SEP-7"));
+        assert!(example.rust_snippet.contains("examples/mobile-wallet-dapp"));
+        assert!(gallery
+            .run_example_execution("mobile-wallet-dapp")
+            .unwrap()
+            .contains("Mobile Wallet Contract Dapp"));
+
+        // And it survives the Markdown export the gallery documents itself
+        // with, so the docs and the registry cannot disagree.
+        assert!(gallery
+            .export_markdown_gallery()
+            .contains("Mobile Wallet Contract Dapp"));
     }
 }

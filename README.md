@@ -153,6 +153,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Security Policy](SECURITY.md) - Vulnerability reporting and security SLA
 - [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) - Setup guide, workflow, and testing
 - [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
+- [Mobile Wallet Dapp Example](examples/mobile-wallet-dapp/README.md) - Phone-sized dapp: wallet connect, contract calls, SEP-7 handoff and phrase recovery (Issue #128)
 - [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale
 - [Marketplace Listings & Royalty Splitting](docs/MARKETPLACE_ROYALTY.md) - SEP-41 marketplace contract and royalty splitter (Issues #146, #147)
 - [Collection Access Control](docs/COLLECTION_ACCESS_CONTROL.md) - Per-collection roles and permission bitmasks (Issue #148)
