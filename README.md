@@ -164,6 +164,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Threat Model](docs/THREAT_MODEL.md) - Attack surface, mitigations and the automated check for each (Issue #116)
 - [Informal Verification](docs/INFORMAL_VERIFICATION.md) - Property harness, invariant catalogue, how to add one (Issue #116)
 - [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
+- [Anomaly Alerting](docs/ANOMALY_ALERTING.md) - Baseline-relative alerts for drains, bursts and replays, with the triage runbook (Issue #124)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)

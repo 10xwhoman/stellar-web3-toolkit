@@ -33,6 +33,16 @@ services:
       - prometheus-data:/prometheus
     command: --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus
 
+  # Alert routing for the anomaly rules in monitoring/alert-rules.yml
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command: --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/alertmanager
+
   grafana:
     image: grafana/grafana:11.2.2
     ports:
@@ -51,4 +61,5 @@ volumes:
   cargo-git:
   stellar-data:
   prometheus-data:
+  alertmanager-data:
   grafana-data:

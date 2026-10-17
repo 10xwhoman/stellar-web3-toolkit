@@ -287,6 +287,20 @@ jobs:
         # Issue #116: sampled search for counterexamples to the stated
         # invariants; the seed is pinned so a failure is reproducible.
         run: cargo run -p stellar-toolkit -- verify invariants --iterations 512
+      - name: Anomalous activity sweep (steady window must stay quiet)
+        # Issue #124: the committed steady window is the negative control. A
+        # detector that fires on it would page an operator for nothing.
+        run: cargo run -p stellar-toolkit -- monitoring anomalies --input monitoring/samples/steady.json
+      - name: Anomalous activity sweep (injected spike must be caught)
+        # The positive control: if the injected drain stops being detected, the
+        # check has silently stopped protecting anything.
+        run: |
+          set -o pipefail
+          if cargo run -p stellar-toolkit -- monitoring anomalies --input monitoring/samples/outflow-spike.json; then
+            echo "::error::the injected outflow spike in monitoring/samples/outflow-spike.json was not detected"
+            exit 1
+          fi
+          echo "the injected spike was detected"
 
   merge-check:
     name: Merge Queue Check
