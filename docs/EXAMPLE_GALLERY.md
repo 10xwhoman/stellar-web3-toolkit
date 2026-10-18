@@ -159,3 +159,46 @@ client.release(&id);                                 // credited to the recipien
 client.set_delegate(&holder, &delegate, &token, &800, &500);
 client.move_from(&holder, &token, &delegate, &payee, &300);
 ```
+
+---
+
+## 8. Mobile Wallet Contract Dapp
+
+A phone-sized dapp that talks to the toolkit's contracts: connect a wallet, sign a
+payment, simulate a read, prepare and submit a write, hand the payment to a wallet
+app when there is no browser extension, and recover an account from a BIP-39
+phrase.
+
+- **Category**: Wallet / Mobile
+- **Docs**: [`examples/mobile-wallet-dapp/README.md`](../examples/mobile-wallet-dapp/README.md)
+- **CLI Run Command**: `stellar-toolkit example run --id mobile-wallet-dapp --network testnet`
+
+```js
+import { createWallet, freighterProvider } from './src/wallet.mjs';
+
+const wallet = createWallet({ config, server, provider: await freighterProvider() });
+const from = await wallet.connect();
+
+// Payment: build, sign in the wallet, submit, confirm.
+await wallet.sendPayment({ from, to: recipient, amount: '1.5' });
+
+// Contract read: simulated, never signed.
+const balance = await wallet.readContract({
+  from, contractId, method: 'balance_of', args: [holder, token],
+});
+
+// Contract write: prepared by the RPC, signed by the wallet, confirmed.
+await wallet.invokeContract({
+  from, contractId, method: 'deposit', args: [holder, token, 1_000n],
+});
+```
+
+On a phone there is no extension, so the same payment can be handed to a wallet
+app with a SEP-7 link instead:
+
+```js
+import { buildPaymentLink, openDeepLink } from './src/deeplink.mjs';
+
+const { uri, warnings } = buildPaymentLink({ destination, amount: '1.5' });
+await openDeepLink(uri);      // opens the wallet app
+```
