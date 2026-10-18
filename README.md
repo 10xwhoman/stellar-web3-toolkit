@@ -163,6 +163,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
 - [Key Management & Cold Storage](docs/KEY_MANAGEMENT.md) - Key tiers, cold-storage signing, rotation runbook (Issue #115)
 - [Threat Model](docs/THREAT_MODEL.md) - Attack surface, mitigations and the automated check for each (Issue #116)
+- [Bridge Pause Timelock](docs/BRIDGE_PAUSE_TIMELOCK.md) - Guardian-announced pauses, timelocked resume and the incident runbook (Issue #239)
 - [Informal Verification](docs/INFORMAL_VERIFICATION.md) - Property harness, invariant catalogue, how to add one (Issue #116)
 - [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
