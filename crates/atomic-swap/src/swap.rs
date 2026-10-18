@@ -35,6 +35,12 @@ pub struct AtomicSwap {
     pub status: SwapStatus,
     pub direction: SwapDirection,
     pub contract_address: Option<String>,
+    /// Chain the initiating transfer came from, when this swap is one leg of a
+    /// cross-chain flow (#238). `None` for a purely local swap.
+    pub origin_chain: Option<String>,
+    /// Sender-chosen nonce of that transfer, consumed once by the coordinator's
+    /// replay guard. `None` for a purely local swap.
+    pub origin_nonce: Option<u64>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -70,8 +76,24 @@ impl AtomicSwap {
             status: SwapStatus::Pending,
             direction: SwapDirection::InitiatorToParticipant,
             contract_address: None,
+            origin_chain: None,
+            origin_nonce: None,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Declare the cross-chain origin of this swap's initiating transfer. The
+    /// coordinator consumes the nonce against the replay guard before the swap
+    /// is stored.
+    pub fn with_origin(mut self, chain: impl Into<String>, nonce: u64) -> Self {
+        self.origin_chain = Some(chain.into());
+        self.origin_nonce = Some(nonce);
+        self
+    }
+
+    /// True when the swap is a leg of a cross-chain flow.
+    pub fn is_cross_chain(&self) -> bool {
+        self.origin_chain.is_some()
     }
 
     pub fn is_pending(&self) -> bool {
