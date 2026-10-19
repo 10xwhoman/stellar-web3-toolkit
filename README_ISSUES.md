@@ -69,18 +69,6 @@ High (200 points)
 - [ ] Write comprehensive tests (unit + integration)
 - [ ] Document usage with examples
 
-## Technical Requirements
-- Rust/Soroban SDK
-- Stellar Testnet integration
-- WASM compilation pipeline
-- Environment-based configuration (dev/test/prod)
-
-## Resources
-- https://soroban.stellar.org/
-- https://developers.stellar.org/docs/smart-contracts
-```
-
----
 
 ## Issue 2: Build Stellar cross-asset atomic swap with HTLC
 
