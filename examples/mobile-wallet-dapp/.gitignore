@@ -1,0 +1,3 @@
+# Installed dependencies and build output are never committed.
+node_modules/
+dist/

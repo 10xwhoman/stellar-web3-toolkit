@@ -153,6 +153,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Security Policy](SECURITY.md) - Vulnerability reporting and security SLA
 - [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) - Setup guide, workflow, and testing
 - [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
+- [Mobile Wallet Dapp Example](examples/mobile-wallet-dapp/README.md) - Phone-sized dapp: wallet connect, contract calls, SEP-7 handoff and phrase recovery (Issue #128)
 - [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale
 - [Marketplace Listings & Royalty Splitting](docs/MARKETPLACE_ROYALTY.md) - SEP-41 marketplace contract and royalty splitter (Issues #146, #147)
 - [Collection Access Control](docs/COLLECTION_ACCESS_CONTROL.md) - Per-collection roles and permission bitmasks (Issue #148)
@@ -162,9 +163,12 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
 - [Key Management & Cold Storage](docs/KEY_MANAGEMENT.md) - Key tiers, cold-storage signing, rotation runbook (Issue #115)
 - [Threat Model](docs/THREAT_MODEL.md) - Attack surface, mitigations and the automated check for each (Issue #116)
+- [Bridge Pause Timelock](docs/BRIDGE_PAUSE_TIMELOCK.md) - Guardian-announced pauses, timelocked resume and the incident runbook (Issue #239)
 - [Informal Verification](docs/INFORMAL_VERIFICATION.md) - Property harness, invariant catalogue, how to add one (Issue #116)
 - [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
+- [Anomaly Alerting](docs/ANOMALY_ALERTING.md) - Baseline-relative alerts for drains, bursts and replays, with the triage runbook (Issue #124)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
+- [Cross-Chain Replay Protection](docs/CROSS_CHAIN_REPLAY.md) - Chain-bound intent digests, per-domain nonce windows and the replay runbook (Issue #238)
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)
 - [Rust Documentation](https://doc.rust-lang.org/)

@@ -44,3 +44,110 @@ groups:
           severity: warning
         annotations:
           summary: "High failed transaction rate on {{ $labels.contract_id }}"
+
+  # Anomalous on-chain activity (issue #124).
+  #
+  # The rules above compare a metric with a fixed line. These compare it with
+  # the metric's *own* recent median, so a contract that is quiet and a contract
+  # that is busy are each judged against what is normal for them, and a drain is
+  # a deviation rather than a number that has to be guessed in advance.
+  #
+  # PromQL has no median absolute deviation, so these are the live-stack
+  # approximation: the deviation is measured against `quantile_over_time(0.5,...)`
+  # plus a floor, which needs no subquery and is cheap enough to evaluate every
+  # 30s. The authoritative scoring -- median and MAD, with the flat-baseline
+  # dispersion floor -- is `stellar-toolkit monitoring anomalies`, which the
+  # `automated-checks` CI job runs against monitoring/samples/*.json. Keep the
+  # names, thresholds and severities of the two in step; docs/ANOMALY_ALERTING.md
+  # says which is which and how to tune them.
+  - name: stellar-anomalies
+    interval: 30s
+    rules:
+      - alert: AnomalousInvocationBurst
+        expr: |
+          rate(stellar_contract_invocations_total[5m])
+            > 4 * quantile_over_time(0.5, rate(stellar_contract_invocations_total[5m])[1h:1m])
+              + 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Invocation burst above baseline on {{ $labels.contract_id }}"
+          description: "Invocations are more than four median deviations above this contract's own median — possible spam or bot activity."
+
+      - alert: AnomalousFailedInvocations
+        expr: |
+          increase(stellar_contract_failed_invocations_total[5m])
+            > 4 * quantile_over_time(0.5, increase(stellar_contract_failed_invocations_total[5m])[1h:1m])
+              + 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failed invocations above baseline on {{ $labels.contract_id }}"
+          description: "A caller is retrying something that has stopped succeeding."
+
+      - alert: AuthFailureSpike
+        expr: |
+          increase(stellar_contract_auth_failures_total[5m])
+            > 3.5 * quantile_over_time(0.5, increase(stellar_contract_auth_failures_total[5m])[1h:1m])
+              + 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Authorisation failures spiking on {{ $labels.contract_id }}"
+          description: "Someone is guessing authorisations. Honest traffic does not produce a spike here."
+
+      - alert: AnomalousOutflow
+        expr: |
+          increase(stellar_contract_outflow_stroops[5m])
+            > 4 * quantile_over_time(0.5, increase(stellar_contract_outflow_stroops[5m])[1h:1m])
+              + 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Value leaving {{ $labels.contract_id }} far above baseline"
+          description: "Outflow is well outside this contract's normal range — treat as a drain in progress. Check the bridge pause timelock before anything else."
+
+      - alert: AnomalousPauseEvents
+        expr: |
+          increase(stellar_bridge_pause_events_total[15m])
+            > 3 * quantile_over_time(0.5, increase(stellar_bridge_pause_events_total[15m])[6h:5m])
+              + 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Repeated pause events on {{ $labels.contract_id }}"
+          description: "The bridge is being taken down repeatedly — either an incident is escalating or someone is cycling the guard."
+
+      - alert: NonceReplaySpotted
+        expr: increase(stellar_nonce_replays_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A signed transfer was re-presented on {{ $labels.contract_id }}"
+          description: "Nonce replay protection refused a reused (chain, sender, nonce). Honest traffic cannot increment this counter — investigate the relayer immediately."
+
+      - alert: SenderConcentration
+        expr: |
+          quantile_over_time(0.5, stellar_distinct_senders[1h])
+            > 3.5 * stellar_distinct_senders
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unique senders collapsed on {{ $labels.contract_id }}"
+          description: "Activity has concentrated into very few accounts — the median sender count is far above the current one."
+
+      - alert: StorageTtlLow
+        expr: stellar_contract_entry_ttl_min < 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shortest entry TTL on {{ $labels.contract_id }} is {{ $value }} ledgers"
+          description: "State is heading for archival; entries are bumped on write, so a low floor means a key is no longer being written."

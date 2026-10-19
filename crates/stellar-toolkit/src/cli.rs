@@ -42,7 +42,7 @@ pub enum ToolkitCommand {
     /// Wallet commands: recovery phrases, keypair derivation, funding, signing
     #[command(subcommand)]
     Wallet(WalletCommand),
-    /// Monitoring dashboard for testnet contracts (Horizon + Soroban health, WASM verification)
+    /// Monitoring: dashboard (Horizon + Soroban health, WASM verification) and anomaly sweep
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
     /// Scaffold a Soroban contract project from the built-in template
@@ -287,6 +287,37 @@ pub enum MonitoringCommand {
         #[arg(long, default_value = "target/monitoring")]
         snapshot: PathBuf,
     },
+    /// Score the newest sample of each metric against its own baseline (#124)
+    Anomalies {
+        /// Sample window: JSON object of metric name to chronological samples
+        #[arg(long)]
+        input: PathBuf,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Multiplier applied to every rule threshold (above 1.0 is less sensitive)
+        #[arg(long, default_value_t = 1.0)]
+        threshold_scale: f64,
+        /// Samples needed before a baseline is trusted
+        #[arg(long, default_value_t = crate::anomaly::DEFAULT_MIN_SAMPLES)]
+        min_samples: usize,
+        /// How many of the most recent samples form the baseline
+        #[arg(long, default_value_t = crate::anomaly::DEFAULT_BASELINE_WINDOW)]
+        baseline_window: usize,
+        /// Lowest severity that makes the command exit non-zero
+        #[arg(long, value_enum, default_value = "critical")]
+        fail_on: FailOn,
+    },
+}
+
+/// Severity floor for `monitoring anomalies`, so a noisy deployment can set the
+/// bar for failing a build without changing the rules themselves.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailOn {
+    Critical,
+    Warning,
+    /// Never exit non-zero; report only.
+    Never,
 }
 
 #[derive(Subcommand, Debug)]
@@ -535,8 +566,9 @@ fn print_wallet(w: &crate::wallet::GeneratedWallet) {
 }
 
 fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
+    use crate::anomaly::severity_rank;
     use crate::monitoring_dashboard::{
-        restore_snapshot, MonitorConfig, MonitoringDashboard, SNAPSHOT_CHECKSUMS,
+        restore_snapshot, AlertSeverity, MonitorConfig, MonitoringDashboard, SNAPSHOT_CHECKSUMS,
     };
     let root = normalize_workspace_root(&PathBuf::from("."));
     match cmd {
@@ -636,6 +668,60 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
                     "hash mismatch in {} contract(s)",
                     report.summary.hash_mismatches
                 )));
+            }
+            Ok(())
+        }
+        MonitoringCommand::Anomalies {
+            input,
+            json,
+            threshold_scale,
+            min_samples,
+            baseline_window,
+            fail_on,
+        } => {
+            use crate::anomaly::{AnomalyDetector, DetectorConfig};
+            let path = resolve_path(&root, input);
+            let series = crate::anomaly::load_series(&path)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            let config = DetectorConfig {
+                min_samples: *min_samples,
+                baseline_window: *baseline_window,
+                ..DetectorConfig::default()
+            };
+            let detector = AnomalyDetector::new()
+                .with_config(config)
+                .with_threshold_scale(*threshold_scale);
+            let report = detector.sweep(&series);
+
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.render());
+            }
+
+            // The exit code is the check: CI gates on it, and an operator
+            // piping the report to a file still gets a usable status.
+            let floor = match fail_on {
+                FailOn::Critical => Some(AlertSeverity::Critical),
+                FailOn::Warning => Some(AlertSeverity::Warning),
+                FailOn::Never => None,
+            };
+            if let Some(floor) = floor {
+                let offending = report
+                    .fired()
+                    .into_iter()
+                    .filter(|verdict| {
+                        verdict
+                            .severity
+                            .as_ref()
+                            .is_some_and(|s| severity_rank(s) >= severity_rank(&floor))
+                    })
+                    .count();
+                if offending > 0 {
+                    return Err(ToolkitError::ExecutionError(format!(
+                        "{offending} anomaly/anomalies at or above {floor:?} severity"
+                    )));
+                }
             }
             Ok(())
         }

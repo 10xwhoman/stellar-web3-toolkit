@@ -2,6 +2,7 @@
 //!
 //! Provides CLI utilities, build management, and account abstraction session key primitives.
 
+pub mod anomaly;
 pub mod api_reference_gen;
 pub mod cli;
 pub mod env_config;
@@ -25,6 +26,10 @@ pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
 
+pub use anomaly::{
+    catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
+    MetricVerdict, Series,
+};
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
 pub use cli::{App, ToolkitCommand};
 pub use env_config::{

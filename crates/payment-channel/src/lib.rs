@@ -4,9 +4,13 @@
 //! This library provides a Rust API for creating, managing, and closing
 //! payment channels, as well as executing off-chain payments.
 
+pub mod reorg;
+
 use parking_lot::RwLock;
+use reorg::{ReorgError, ReorgLog};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 
 /// Payment channel errors
@@ -35,6 +39,20 @@ pub enum PaymentChannelError {
 
     #[error("Channel closed: {0}")]
     ChannelClosed(String),
+
+    #[error(
+        "Reorg detected on channel {channel_id}: update at ledger height {incoming} is not after the recorded height {recorded}"
+    )]
+    ReorgDetected {
+        channel_id: String,
+        recorded: u32,
+        incoming: u32,
+    },
+
+    #[error(
+        "Channel {channel_id} has no state at or below ledger height {height}; resync from chain is required"
+    )]
+    NoStateForReorg { channel_id: String, height: u32 },
 }
 
 /// Channel status
@@ -53,7 +71,7 @@ pub enum ChannelStatus {
 }
 
 /// Local channel state for a participant
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalChannelState {
     /// Channel ID
     pub channel_id: String,
@@ -86,7 +104,7 @@ pub struct LocalChannelState {
 }
 
 /// HTLC state
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HtlcState {
     /// HTLC ID
     pub htlc_id: String,
@@ -143,12 +161,45 @@ pub struct PaymentResult {
     pub error: Option<String>,
 }
 
+/// What a reorg did to the manager's channels
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReorgReport {
+    /// The height the chain forked at.
+    pub fork_height: u32,
+    /// Channels restored from a snapshot at or below the fork height.
+    pub rolled_back: Vec<String>,
+    /// Channels with no snapshot at or below the fork height. Their local
+    /// state is unknown and must be re-read from chain.
+    pub unresolved: Vec<String>,
+    /// Snapshots above the fork height that were discarded.
+    pub dropped_snapshots: usize,
+}
+
+impl ReorgReport {
+    /// Whether the reorg was fully reconciled without a chain resync.
+    pub fn is_clean(&self) -> bool {
+        self.unresolved.is_empty()
+    }
+}
+
+/// Local channel state plus the per-channel snapshot history needed to unwind
+/// it when the ledger it was built on disappears.
+struct TrackedChannel {
+    state: LocalChannelState,
+    history: ReorgLog,
+}
+
 /// Channel manager for handling all channel operations
 pub struct ChannelManager {
-    /// Local channel states
-    channels: RwLock<HashMap<String, LocalChannelState>>,
+    /// Local channel states, each with its reorg history
+    channels: RwLock<HashMap<String, TrackedChannel>>,
     /// Signer for creating signatures
     signer: Box<dyn SignatureSigner>,
+    /// Highest ledger height applied so far, used by the height-agnostic
+    /// [`ChannelManager::execute_payment`] entry point.
+    ledger_height: AtomicU32,
+    /// How many past heights to retain per channel.
+    history_depth: u32,
 }
 
 /// Signature signer trait
@@ -169,11 +220,19 @@ pub trait SignatureSigner: Send + Sync {
 }
 
 impl ChannelManager {
-    /// Create a new channel manager
+    /// Create a new channel manager with the default reorg history depth
     pub fn new(signer: Box<dyn SignatureSigner>) -> Self {
+        Self::with_history_depth(signer, reorg::DEFAULT_REORG_HISTORY_DEPTH)
+    }
+
+    /// Create a new channel manager that retains `history_depth` ledgers of
+    /// channel state for reorg rollback.
+    pub fn with_history_depth(signer: Box<dyn SignatureSigner>, history_depth: u32) -> Self {
         ChannelManager {
             channels: RwLock::new(HashMap::new()),
             signer,
+            ledger_height: AtomicU32::new(0),
+            history_depth,
         }
     }
 
@@ -208,65 +267,177 @@ impl ChannelManager {
             remote_public_key: Vec::new(), // Will be set during handshake
         };
 
-        // Store the channel
-        self.channels.write().insert(channel_id, state.clone());
+        // Store the channel, anchored with a genesis snapshot so that a reorg
+        // below every applied update still has something to restore. Height 0
+        // also matches the funding height the channel is created at.
+        let mut history = ReorgLog::new(self.history_depth);
+        history
+            .record(0, state.clone())
+            .expect("an empty history log accepts any height");
+
+        self.channels.write().insert(
+            channel_id,
+            TrackedChannel {
+                state: state.clone(),
+                history,
+            },
+        );
 
         Ok(state)
     }
 
-    /// Execute an off-chain payment
+    /// Execute an off-chain payment at the next inferred ledger height.
+    ///
+    /// Prefer [`ChannelManager::execute_payment_at`] when the caller knows the
+    /// real ledger height: a reorg can only be reconciled against heights that
+    /// come from the chain.
     pub fn execute_payment(
         &self,
         channel_id: &str,
         amount: i128,
         direction: PaymentDirection,
     ) -> Result<LocalChannelState, PaymentChannelError> {
+        let ledger_height = self.next_ledger_height();
+        self.execute_payment_at(channel_id, amount, direction, ledger_height)
+    }
+
+    /// Execute an off-chain payment observed at `ledger_height`.
+    ///
+    /// The resulting state is recorded against that height so a later
+    /// [`ChannelManager::handle_reorg`] can unwind it.
+    pub fn execute_payment_at(
+        &self,
+        channel_id: &str,
+        amount: i128,
+        direction: PaymentDirection,
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels
+        let channel = channels
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
         // Check if channel is open
-        if state.status != ChannelStatus::Open {
-            return Err(PaymentChannelError::ChannelClosed(state.status.to_string()));
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::ChannelClosed(
+                channel.state.status.to_string(),
+            ));
         }
+
+        // Validate the height before touching the balances: a rejected update
+        // must leave the channel exactly as it was.
+        check_height(channel_id, &channel.history, ledger_height)?;
 
         // Update balances
         match direction {
             PaymentDirection::ToThem => {
-                if state.our_balance < amount {
+                if channel.state.our_balance < amount {
                     return Err(PaymentChannelError::InsufficientBalance {
-                        have: state.our_balance,
+                        have: channel.state.our_balance,
                         need: amount,
                     });
                 }
-                state.our_balance -= amount;
-                state.their_balance += amount;
+                channel.state.our_balance -= amount;
+                channel.state.their_balance += amount;
             }
             PaymentDirection::ToUs => {
-                if state.their_balance < amount {
+                if channel.state.their_balance < amount {
                     return Err(PaymentChannelError::InsufficientBalance {
-                        have: state.their_balance,
+                        have: channel.state.their_balance,
                         need: amount,
                     });
                 }
-                state.their_balance -= amount;
-                state.our_balance += amount;
+                channel.state.their_balance -= amount;
+                channel.state.our_balance += amount;
             }
         }
 
-        state.sequence_number += 1;
-        Ok(state.clone())
+        channel.state.sequence_number += 1;
+
+        record_state(channel_id, channel, ledger_height)?;
+
+        Ok(channel.state.clone())
+    }
+
+    /// Anchor the channel's current state at `ledger_height` without changing
+    /// it, for updates applied outside this manager (a handshake, an on-chain
+    /// confirmation, an imported channel state).
+    pub fn record_channel_state(
+        &self,
+        channel_id: &str,
+        ledger_height: u32,
+    ) -> Result<(), PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        check_height(channel_id, &channel.history, ledger_height)?;
+        record_state(channel_id, channel, ledger_height)
+    }
+
+    /// Unwind every channel to the given fork height after a ledger reorg.
+    ///
+    /// Channels with a snapshot at or below `fork_height` are restored to their
+    /// newest such state and all later snapshots are discarded. Channels
+    /// without one are reported as unresolved: their local state cannot be
+    /// trusted and must be re-read from chain.
+    pub fn handle_reorg(&self, fork_height: u32) -> ReorgReport {
+        let mut channels = self.channels.write();
+        let mut report = ReorgReport {
+            fork_height,
+            ..Default::default()
+        };
+
+        for (channel_id, channel) in channels.iter_mut() {
+            let (restored, dropped) = channel.history.rollback_to(fork_height);
+            report.dropped_snapshots += dropped;
+
+            match restored {
+                Some(state) => {
+                    channel.state = state;
+                    report.rolled_back.push(channel_id.clone());
+                }
+                None => report.unresolved.push(channel_id.clone()),
+            }
+        }
+
+        // `HashMap` iteration order is unspecified; sort the report so callers
+        // can diff two reorg events without spurious changes.
+        report.rolled_back.sort();
+        report.unresolved.sort();
+
+        report
+    }
+
+    /// Recorded ledger heights for a channel, oldest first.
+    pub fn recorded_heights(&self, channel_id: &str) -> Option<Vec<u32>> {
+        self.channels
+            .read()
+            .get(channel_id)
+            .map(|channel| channel.history.heights())
     }
 
     /// Get a channel by ID
     pub fn get_channel(&self, channel_id: &str) -> Option<LocalChannelState> {
-        self.channels.read().get(channel_id).cloned()
+        self.channels
+            .read()
+            .get(channel_id)
+            .map(|channel| channel.state.clone())
     }
 
     /// Get all channels
     pub fn get_all_channels(&self) -> Vec<LocalChannelState> {
-        self.channels.read().values().cloned().collect()
+        self.channels
+            .read()
+            .values()
+            .map(|channel| channel.state.clone())
+            .collect()
+    }
+
+    /// The height a height-agnostic update is attributed to.
+    fn next_ledger_height(&self) -> u32 {
+        self.ledger_height.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Close a channel cooperatively
@@ -279,15 +450,19 @@ impl ChannelManager {
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-        if state.status != ChannelStatus::Open {
+        if state.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::InvalidState(format!(
                 "Cannot close channel in state {:?}",
-                state.status
+                state.state.status
             )));
         }
 
-        state.status = ChannelStatus::Closing;
-        Ok(state.clone())
+        let ledger_height = self.next_ledger_height();
+        check_height(channel_id, &state.history, ledger_height)?;
+        state.state.status = ChannelStatus::Closing;
+        record_state(channel_id, state, ledger_height)?;
+
+        Ok(state.state.clone())
     }
 
     /// Initiate a unilateral close
@@ -300,8 +475,12 @@ impl ChannelManager {
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-        state.status = ChannelStatus::ForceClosed;
-        Ok(state.clone())
+        let ledger_height = self.next_ledger_height();
+        check_height(channel_id, &state.history, ledger_height)?;
+        state.state.status = ChannelStatus::ForceClosed;
+        record_state(channel_id, state, ledger_height)?;
+
+        Ok(state.state.clone())
     }
 
     /// Rebalance a channel
@@ -315,18 +494,22 @@ impl ChannelManager {
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-        if state.status != ChannelStatus::Open {
+        if state.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::InvalidState(
                 "Channel not open".to_string(),
             ));
         }
 
-        // Add funds to both sides (requires on-chain transaction)
-        state.our_balance += amount;
-        state.their_balance += amount;
-        state.sequence_number += 1;
+        let ledger_height = self.next_ledger_height();
+        check_height(channel_id, &state.history, ledger_height)?;
 
-        Ok(state.clone())
+        // Add funds to both sides (requires on-chain transaction)
+        state.state.our_balance += amount;
+        state.state.their_balance += amount;
+        state.state.sequence_number += 1;
+        record_state(channel_id, state, ledger_height)?;
+
+        Ok(state.state.clone())
     }
 
     /// Generate a deterministic channel ID
@@ -343,6 +526,50 @@ impl ChannelManager {
 
         hex::encode(result)
     }
+}
+
+/// Reject an update that claims a height the channel has already passed.
+///
+/// This is the reorg signal at the update level: the chain the earlier state
+/// was built on has been replaced, so applying a lower height would silently
+/// build two divergent histories into one channel.
+fn check_height(
+    channel_id: &str,
+    history: &ReorgLog,
+    ledger_height: u32,
+) -> Result<(), PaymentChannelError> {
+    match history.last_height() {
+        Some(recorded) if ledger_height <= recorded => Err(PaymentChannelError::ReorgDetected {
+            channel_id: channel_id.to_string(),
+            recorded,
+            incoming: ledger_height,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Anchor the channel's current state at `ledger_height`.
+///
+/// Callers must run [`check_height`] first so that a rejected height never
+/// leaves the channel mutated but unrecorded.
+fn record_state(
+    channel_id: &str,
+    channel: &mut TrackedChannel,
+    ledger_height: u32,
+) -> Result<(), PaymentChannelError> {
+    channel
+        .history
+        .record(ledger_height, channel.state.clone())
+        .map_err(|e| match e {
+            ReorgError::NonMonotonicHeight { last, height } => PaymentChannelError::ReorgDetected {
+                channel_id: channel_id.to_string(),
+                recorded: last,
+                incoming: height,
+            },
+            other => PaymentChannelError::InvalidState(other.to_string()),
+        })?;
+
+    Ok(())
 }
 
 /// Payment direction
@@ -385,6 +612,201 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Signer that accepts anything, so the tests can focus on state handling.
+    struct TestSigner;
+
+    impl SignatureSigner for TestSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, PaymentChannelError> {
+            Ok(message.to_vec())
+        }
+
+        fn verify(
+            &self,
+            _message: &[u8],
+            _signature: &[u8],
+            _public_key: &[u8],
+        ) -> Result<bool, PaymentChannelError> {
+            Ok(true)
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            vec![7u8; 32]
+        }
+    }
+
+    async fn manager_with_channel(depth: u32) -> (ChannelManager, String) {
+        let manager = ChannelManager::with_history_depth(Box::new(TestSigner), depth);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+        (manager, state.channel_id)
+    }
+
+    #[tokio::test]
+    async fn reorg_rolls_back_payments_above_the_fork_height() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 10)
+            .unwrap();
+        manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 11)
+            .unwrap();
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 800);
+
+        let report = manager.handle_reorg(10);
+        assert!(report.is_clean());
+        assert_eq!(report.rolled_back, vec![channel_id.clone()]);
+        assert_eq!(report.dropped_snapshots, 1);
+
+        let state = manager.get_channel(&channel_id).unwrap();
+        assert_eq!(state.our_balance, 900);
+        assert_eq!(state.their_balance, 1_100);
+        assert_eq!(state.sequence_number, 1);
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 10]);
+    }
+
+    #[tokio::test]
+    async fn reorg_to_the_funding_height_restores_the_opening_state() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        for height in [10, 11, 12] {
+            manager
+                .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, height)
+                .unwrap();
+        }
+
+        let report = manager.handle_reorg(0);
+        assert_eq!(report.rolled_back.len(), 1);
+
+        let state = manager.get_channel(&channel_id).unwrap();
+        assert_eq!(state.our_balance, 1_000);
+        assert_eq!(state.their_balance, 1_000);
+        assert_eq!(state.sequence_number, 0);
+    }
+
+    #[tokio::test]
+    async fn an_update_at_a_discarded_height_is_rejected() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 10)
+            .unwrap();
+        manager.handle_reorg(10);
+
+        // The same height was already applied on the discarded branch.
+        let err = manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 10)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PaymentChannelError::ReorgDetected {
+                channel_id: channel_id.clone(),
+                recorded: 10,
+                incoming: 10,
+            }
+        );
+
+        // A rejected update leaves the channel untouched.
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 900);
+
+        // The next height on the new chain is accepted.
+        manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 11)
+            .unwrap();
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 800);
+    }
+
+    #[tokio::test]
+    async fn a_reorg_below_the_retained_history_is_unresolved() {
+        let (manager, channel_id) = manager_with_channel(2).await;
+
+        for height in [10, 11, 12] {
+            manager
+                .execute_payment_at(&channel_id, 10, PaymentDirection::ToThem, height)
+                .unwrap();
+        }
+
+        // Depth 2 keeps only heights 11 and 12, so a fork at 5 has nothing to
+        // fall back on and must be reported for a chain resync.
+        let report = manager.handle_reorg(5);
+        assert!(!report.is_clean());
+        assert_eq!(report.unresolved, vec![channel_id.clone()]);
+        assert!(report.rolled_back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reorg_report_covers_every_channel_deterministically() {
+        let manager = ChannelManager::with_history_depth(Box::new(TestSigner), 8);
+        let mut channel_ids = Vec::new();
+
+        for (a, b) in [("alice", "bob"), ("carol", "dave")] {
+            let state = manager
+                .create_channel(a.to_string(), b.to_string(), 1_000, 1_000, 100, 0)
+                .await
+                .unwrap();
+            manager
+                .execute_payment_at(&state.channel_id, 10, PaymentDirection::ToThem, 10)
+                .unwrap();
+            channel_ids.push(state.channel_id);
+        }
+
+        let report = manager.handle_reorg(10);
+        channel_ids.sort();
+        assert_eq!(report.rolled_back, channel_ids);
+        assert!(report.is_clean());
+    }
+
+    #[tokio::test]
+    async fn height_agnostic_payments_are_recorded_on_increasing_heights() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager
+            .execute_payment(&channel_id, 10, PaymentDirection::ToThem)
+            .unwrap();
+        manager
+            .execute_payment(&channel_id, 10, PaymentDirection::ToThem)
+            .unwrap();
+
+        let heights = manager.recorded_heights(&channel_id).unwrap();
+        assert_eq!(heights, vec![0, 1, 2]);
+
+        // Rolling back to the funding height undoes both payments.
+        manager.handle_reorg(0);
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 1_000);
+    }
+
+    #[tokio::test]
+    async fn close_and_rebalance_are_also_recorded() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.rebalance(&channel_id, 500).unwrap();
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 1_500);
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap().len(), 2);
+
+        let report = manager.handle_reorg(0);
+        assert_eq!(report.rolled_back.len(), 1);
+        assert_eq!(manager.get_channel(&channel_id).unwrap().our_balance, 1_000);
+    }
+
+    #[tokio::test]
+    async fn record_channel_state_anchors_without_mutating() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+        let before = manager.get_channel(&channel_id).unwrap();
+
+        manager.record_channel_state(&channel_id, 7).unwrap();
+
+        assert_eq!(manager.get_channel(&channel_id).unwrap(), before);
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 7]);
+
+        // Re-anchoring an old height is the same reorg signal as a payment.
+        assert!(matches!(
+            manager.record_channel_state(&channel_id, 7),
+            Err(PaymentChannelError::ReorgDetected { .. })
+        ));
+    }
 
     #[test]
     fn test_channel_id_generation() {

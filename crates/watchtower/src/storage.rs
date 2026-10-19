@@ -4,9 +4,78 @@
 
 use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use crate::Alert;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
+
+/// Retention rules applied by [`StorageBackend::compact`].
+///
+/// A watchtower writes continuously -- a state and an update per channel per
+/// scan, plus an alert per incident -- so without retention the store grows
+/// with uptime rather than with the number of channels being watched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionPolicy {
+    /// Keep at most this many alerts, newest first.
+    pub max_alerts: usize,
+    /// Drop alerts older than this, in seconds.
+    pub alert_retention_secs: u64,
+    /// Drop the cached update of a channel not refreshed within this, in
+    /// seconds. A channel that keeps being scanned keeps its update fresh, so
+    /// only unsubscribed or abandoned channels age out.
+    pub update_retention_secs: u64,
+    /// Keep at most this many cached channel updates, newest first.
+    pub max_channel_updates: usize,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        CompactionPolicy {
+            max_alerts: 1_000,
+            alert_retention_secs: 7 * 24 * 60 * 60, // one week
+            update_retention_secs: 24 * 60 * 60,    // one day
+            max_channel_updates: 10_000,
+        }
+    }
+}
+
+/// What a compaction pass removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionReport {
+    /// Alerts before the pass.
+    pub alerts_before: usize,
+    /// Alerts after the pass.
+    pub alerts_after: usize,
+    /// Cached channel updates before the pass.
+    pub channel_updates_before: usize,
+    /// Cached channel updates after the pass.
+    pub channel_updates_after: usize,
+    /// Duplicate subscriptions collapsed during the pass.
+    pub subscriptions_deduplicated: usize,
+}
+
+impl CompactionReport {
+    /// Alerts removed by the pass.
+    pub fn alerts_removed(&self) -> usize {
+        self.alerts_before.saturating_sub(self.alerts_after)
+    }
+
+    /// Cached channel updates removed by the pass.
+    pub fn channel_updates_removed(&self) -> usize {
+        self.channel_updates_before
+            .saturating_sub(self.channel_updates_after)
+    }
+
+    /// Everything the pass removed.
+    pub fn total_removed(&self) -> usize {
+        self.alerts_removed() + self.channel_updates_removed() + self.subscriptions_deduplicated
+    }
+
+    /// Whether the pass changed anything.
+    pub fn is_noop(&self) -> bool {
+        self.total_removed() == 0
+    }
+}
 
 /// Storage backend trait
 pub trait StorageBackend: Send + Sync {
@@ -43,6 +112,18 @@ pub trait StorageBackend: Send + Sync {
 
     /// Remove a subscription
     fn remove_subscription(&self, channel_id: &str) -> Result<(), StorageError>;
+
+    /// Apply `policy` to the stored data and report what was removed.
+    ///
+    /// Compaction must never drop data a monitor still depends on: a channel
+    /// that is still subscribed keeps its state and cached update regardless
+    /// of age.
+    fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError>;
+
+    /// Apply the default retention rules.
+    fn compact_with_defaults(&self) -> Result<CompactionReport, StorageError> {
+        self.compact(&CompactionPolicy::default())
+    }
 }
 
 /// In-memory storage backend
@@ -136,6 +217,103 @@ impl StorageBackend for InMemoryStorage {
         subs.retain(|s| s != channel_id);
         Ok(())
     }
+
+    fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {
+        let now = current_timestamp();
+        let mut report = CompactionReport::default();
+
+        // Subscriptions first: the set of channels still being watched decides
+        // what the other passes are allowed to drop.
+        let mut subscriptions: Vec<String> = {
+            let subs = self.subscriptions.read();
+            subs.clone()
+        };
+        let before = subscriptions.len();
+        let mut seen = std::collections::HashSet::with_capacity(before);
+        subscriptions.retain(|id| seen.insert(id.clone()));
+        report.subscriptions_deduplicated = before - subscriptions.len();
+        if report.subscriptions_deduplicated > 0 {
+            *self.subscriptions.write() = subscriptions;
+        }
+
+        let subscribed: std::collections::HashSet<String> = {
+            let subs = self.subscriptions.read();
+            subs.iter().cloned().collect()
+        };
+
+        // Alerts: drop the aged-out ones, then the overflow beyond max_alerts.
+        {
+            let mut alerts = self.alerts.write();
+            report.alerts_before = alerts.len();
+
+            let cutoff = now.saturating_sub(policy.alert_retention_secs);
+            alerts.retain(|alert| alert.timestamp >= cutoff);
+
+            if alerts.len() > policy.max_alerts {
+                // Evict by timestamp rather than by position: a backend that
+                // reloaded from disk is not guaranteed to hold alerts in the
+                // order they arrived, and "the last 1000" must mean the newest.
+                let mut by_age: Vec<(usize, u64)> = alerts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, alert)| (index, alert.timestamp))
+                    .collect();
+                by_age.sort_by_key(|(_, timestamp)| *timestamp);
+
+                let mut evicted: Vec<usize> = by_age
+                    .into_iter()
+                    .take(alerts.len() - policy.max_alerts)
+                    .map(|(index, _)| index)
+                    .collect();
+                // Remove from the back so the earlier indices stay valid.
+                evicted.sort_unstable_by(|a, b| b.cmp(a));
+                for index in evicted {
+                    alerts.remove(index);
+                }
+            }
+
+            report.alerts_after = alerts.len();
+        }
+
+        // Channel updates: keep the freshest `max_channel_updates` among those
+        // that are neither stale nor still subscribed.
+        {
+            let mut updates = self.channel_updates.write();
+            report.channel_updates_before = updates.len();
+
+            let cutoff = now.saturating_sub(policy.update_retention_secs);
+            updates.retain(|channel_id, update| {
+                subscribed.contains(channel_id) || update.timestamp >= cutoff
+            });
+
+            if updates.len() > policy.max_channel_updates {
+                let mut by_age: Vec<(String, u64)> = updates
+                    .iter()
+                    .map(|(id, update)| (id.clone(), update.timestamp))
+                    .collect();
+                by_age.sort_by_key(|(_, timestamp)| *timestamp);
+
+                let excess = updates.len() - policy.max_channel_updates;
+                for (channel_id, _) in by_age.into_iter().take(excess) {
+                    // Never evict a channel we are still watching.
+                    if subscribed.contains(&channel_id) {
+                        continue;
+                    }
+                    updates.remove(&channel_id);
+                }
+            }
+
+            report.channel_updates_after = updates.len();
+        }
+
+        debug!(
+            "Compacted watchtower storage: {} alerts, {} channel updates removed",
+            report.alerts_removed(),
+            report.channel_updates_removed()
+        );
+
+        Ok(report)
+    }
 }
 
 /// SQLite storage backend (placeholder implementation)
@@ -216,6 +394,26 @@ impl StorageBackend for SqliteStorage {
         info!("SQLite: removing subscription for {}", channel_id);
         Ok(())
     }
+
+    fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {
+        // No rows are persisted yet, so there is nothing to reclaim. The
+        // signature still has to exist: callers schedule compaction
+        // unconditionally, and a silent no-op here is preferable to making
+        // every caller check which backend is in use.
+        info!(
+            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s)",
+            policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
+        );
+        Ok(CompactionReport::default())
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Storage errors
@@ -232,8 +430,236 @@ pub enum StorageError {
 }
 
 #[cfg(test)]
+impl InMemoryStorage {
+    /// Insert a duplicate subscription without deduplicating.
+    ///
+    /// Stands in for a backend that does not deduplicate on insert, so the
+    /// compaction pass can be exercised on data it actually has to fix.
+    fn push_raw_subscription(&self, channel_id: &str) {
+        self.subscriptions.write().push(channel_id.to_string());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AlertSeverity;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn monitor_state(channel_id: &str, last_update_ts: u64) -> ChannelMonitorState {
+        ChannelMonitorState {
+            channel_id: channel_id.to_string(),
+            last_known_sequence: 1,
+            last_update_ts,
+            is_closed: false,
+            pending_htlcs: Vec::new(),
+        }
+    }
+
+    fn update(channel_id: &str, timestamp: u64) -> ChannelUpdate {
+        ChannelUpdate {
+            channel_id: channel_id.to_string(),
+            sequence_number: 1,
+            balance_a: 100,
+            balance_b: 100,
+            is_closed: false,
+            close_type: None,
+            block_height: 1,
+            timestamp,
+        }
+    }
+
+    fn alert_at(timestamp: u64) -> Alert {
+        let mut alert = Alert::breach_attempt("channel1".to_string(), 1, 2);
+        alert.timestamp = timestamp;
+        alert
+    }
+
+    #[test]
+    fn compaction_drops_alerts_past_the_retention_window() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        storage.store_alert(&alert_at(now)).unwrap();
+        storage.store_alert(&alert_at(now - 2 * DAY)).unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                alert_retention_secs: DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.alerts_before, 2);
+        assert_eq!(report.alerts_after, 1);
+        assert_eq!(report.alerts_removed(), 1);
+        assert_eq!(storage.get_alerts(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compaction_keeps_the_newest_alerts_up_to_the_limit() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        // Appended oldest first, the way alerts actually arrive.
+        for i in (0..5).rev() {
+            storage.store_alert(&alert_at(now - i)).unwrap();
+        }
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_alerts: 2,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.alerts_removed(), 3);
+
+        let remaining = storage.get_alerts(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        // Returned newest first, and the two newest timestamps survived.
+        assert_eq!(remaining[0].timestamp, now);
+        assert_eq!(remaining[1].timestamp, now - 1);
+    }
+
+    #[test]
+    fn compaction_drops_stale_updates_but_keeps_subscribed_channels() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        storage.store_subscription("watched").unwrap();
+        storage
+            .store_channel_update(&update("watched", now - 30 * DAY))
+            .unwrap();
+        storage
+            .store_channel_update(&update("abandoned", now - 30 * DAY))
+            .unwrap();
+        storage.store_channel_update(&update("fresh", now)).unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                update_retention_secs: DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.channel_updates_before, 3);
+        assert_eq!(report.channel_updates_after, 2);
+        assert!(storage.get_channel_update("watched").unwrap().is_some());
+        assert!(storage.get_channel_update("abandoned").unwrap().is_none());
+        assert!(storage.get_channel_update("fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn compaction_evicts_the_oldest_updates_beyond_the_limit() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        for i in 0..5 {
+            storage
+                .store_channel_update(&update(&format!("ch{i}"), now - i))
+                .unwrap();
+        }
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_channel_updates: 2,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.channel_updates_removed(), 3);
+        assert!(storage.get_channel_update("ch0").unwrap().is_some());
+        assert!(storage.get_channel_update("ch1").unwrap().is_some());
+        assert!(storage.get_channel_update("ch4").unwrap().is_none());
+    }
+
+    #[test]
+    fn compaction_never_evicts_a_subscribed_channel_to_meet_the_limit() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        storage.store_subscription("watched").unwrap();
+        // The watched channel has the oldest update of the set.
+        storage
+            .store_channel_update(&update("watched", now - 100))
+            .unwrap();
+        for i in 0..3 {
+            storage
+                .store_channel_update(&update(&format!("ch{i}"), now - i))
+                .unwrap();
+        }
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_channel_updates: 1,
+                update_retention_secs: 365 * DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert!(storage.get_channel_update("watched").unwrap().is_some());
+        // The limit is a target, not a guarantee: the subscribed channel stays
+        // even though it is the oldest entry.
+        assert_eq!(report.channel_updates_after, 2);
+    }
+
+    #[test]
+    fn compaction_collapses_duplicate_subscriptions() {
+        let storage = InMemoryStorage::new();
+        storage.store_subscription("ch1").unwrap();
+        storage.push_raw_subscription("ch1");
+        storage.push_raw_subscription("ch2");
+
+        let report = storage.compact(&CompactionPolicy::default()).unwrap();
+
+        assert_eq!(report.subscriptions_deduplicated, 1);
+        assert_eq!(storage.get_subscriptions().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn compaction_on_clean_storage_is_a_noop() {
+        let storage = InMemoryStorage::new();
+        storage.store_subscription("ch1").unwrap();
+        storage.store_alert(&alert_at(current_timestamp())).unwrap();
+
+        let report = storage.compact_with_defaults().unwrap();
+
+        assert!(report.is_noop());
+        assert_eq!(report.total_removed(), 0);
+    }
+
+    #[test]
+    fn compaction_leaves_channel_states_and_subscriptions_intact() {
+        let storage = InMemoryStorage::new();
+        storage.store_subscription("ch1").unwrap();
+        storage
+            .store_channel_state("ch1", &monitor_state("ch1", 0))
+            .unwrap();
+
+        storage.compact_with_defaults().unwrap();
+
+        assert!(storage.get_channel_state("ch1").unwrap().is_some());
+        assert_eq!(storage.get_subscriptions().unwrap(), vec!["ch1"]);
+    }
+
+    #[test]
+    fn sqlite_backend_compaction_is_a_safe_noop() {
+        let storage = SqliteStorage::new(":memory:").unwrap();
+        let report = storage.compact_with_defaults().unwrap();
+        assert!(report.is_noop());
+    }
+
+    #[test]
+    fn alert_severity_is_preserved_across_compaction() {
+        let storage = InMemoryStorage::new();
+        storage.store_alert(&alert_at(current_timestamp())).unwrap();
+        storage.compact_with_defaults().unwrap();
+
+        let alerts = storage.get_alerts(1).unwrap();
+        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
+    }
 
     #[test]
     fn test_in_memory_storage() {

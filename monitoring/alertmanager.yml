@@ -1,0 +1,68 @@
+# Alertmanager routing for the anomaly alerts (issue #124).
+#
+# `monitoring/alert-rules.yml` decides what is anomalous; Alertmanager decides
+# who hears about it and how often. The split that matters here:
+#
+#   * a critical is an incident in progress (a drain, a replayed nonce, a
+#     guardian cycling the pause guard) and is paged immediately;
+#   * a warning is a deviation worth a look, grouped and repeated slowly so it
+#     does not become the reason the channel gets muted.
+#
+# Criticals inhibit the warnings for the same contract: while a contract is
+# being drained, "invocation burst above baseline" is noise on top of the page
+# that already went out.
+#
+# Replace the webhook receivers with the deployment's own sink (PagerDuty,
+# Slack, Opsgenie, a webhook relay). The URLs below are placeholders, and
+# `stellar-alert-relay` is not a host this repository defines.
+
+route:
+  receiver: warnings
+  group_by: [alertname, contract_id]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # An incident in progress: page now, repeat every hour until it resolves.
+    - matchers:
+        - severity="critical"
+      receiver: pager
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+      continue: false
+    # Membership changes and pause activity are always worth hearing about,
+    # even at warning severity.
+    - matchers:
+        - severity=~"warning|critical"
+        - alertname=~"AnomalousPauseEvents|NonceReplaySpotted|AuthFailureSpike"
+      receiver: pager
+      group_wait: 10s
+      repeat_interval: 2h
+
+inhibit_rules:
+  # One page per contract while it is in trouble.
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: [contract_id]
+
+  # Horizon or Soroban being unreachable explains every deviation on the
+  # contracts it serves; do not stack the consequences on top of the cause.
+  - source_matchers:
+      - alertname=~"HorizonDown|SorobanDown|ContractNotFound"
+    target_matchers:
+      - severity=~"warning|critical"
+    equal: [contract_id]
+
+receivers:
+  - name: pager
+    webhook_configs:
+      - url: http://stellar-alert-relay:9095/alerts/incident
+        send_resolved: true
+
+  - name: warnings
+    webhook_configs:
+      - url: http://stellar-alert-relay:9095/alerts/triage
+        send_resolved: true

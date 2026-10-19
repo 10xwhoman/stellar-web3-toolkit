@@ -152,6 +152,32 @@ jobs:
         # Its tests are unit tests inside the crate.
         run: cargo test --package channel-router --lib -- --nocapture
 
+  wallet-example:
+    name: Mobile Wallet Example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The example's dependencies need >= 22.12 (stellar-sdk and vite both
+          # declare it), so this job pins the version rather than floating.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: examples/mobile-wallet-dapp/package-lock.json
+      - name: Install dependencies
+        working-directory: examples/mobile-wallet-dapp
+        run: npm ci
+      - name: Run the wallet, deep-link and recovery tests
+        # Issue #128: no network and no browser — every I/O boundary is injected,
+        # so this is a real gate rather than a smoke test.
+        working-directory: examples/mobile-wallet-dapp
+        run: npm test
+      - name: Build the dapp
+        # Proves the app itself resolves and bundles, which the unit tests (that
+        # import the modules directly) cannot.
+        working-directory: examples/mobile-wallet-dapp
+        run: npm run build
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -287,6 +313,20 @@ jobs:
         # Issue #116: sampled search for counterexamples to the stated
         # invariants; the seed is pinned so a failure is reproducible.
         run: cargo run -p stellar-toolkit -- verify invariants --iterations 512
+      - name: Anomalous activity sweep (steady window must stay quiet)
+        # Issue #124: the committed steady window is the negative control. A
+        # detector that fires on it would page an operator for nothing.
+        run: cargo run -p stellar-toolkit -- monitoring anomalies --input monitoring/samples/steady.json
+      - name: Anomalous activity sweep (injected spike must be caught)
+        # The positive control: if the injected drain stops being detected, the
+        # check has silently stopped protecting anything.
+        run: |
+          set -o pipefail
+          if cargo run -p stellar-toolkit -- monitoring anomalies --input monitoring/samples/outflow-spike.json; then
+            echo "::error::the injected outflow spike in monitoring/samples/outflow-spike.json was not detected"
+            exit 1
+          fi
+          echo "the injected spike was detected"
 
   merge-check:
     name: Merge Queue Check
